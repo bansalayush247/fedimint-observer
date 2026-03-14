@@ -73,3 +73,20 @@ pub struct NonceSpendInfo {
     pub session_index: u64,
     pub estimated_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// Subset of a gateway's registration info suitable for public API responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayInfo {
+    /// Gateway's public key (hex-encoded)
+    pub gateway_id: String,
+    /// LN node public key (hex-encoded)
+    pub node_pub_key: String,
+    pub lightning_alias: String,
+    /// URL of the gateway's public API
+    pub api_endpoint: String,
+    /// Whether the federation has vetted this gateway
+    pub vetted: bool,
+    /// Full raw announcement, useful for forwards-compatible client usage
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<serde_json::Value>,
+}
