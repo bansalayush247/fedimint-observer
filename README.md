@@ -25,6 +25,20 @@ When it comes to stability guarantees the Postgres database should always be mig
 don't lose historic data. The API under `/federations` isn't stable at this point and I'd recommend to subscribing to
 changes in Fedimint Observer if building against it.
 
+### What database migrations actually do
+On startup the backend runs schema setup/migrations in order (`v0.sql`, `v1.sql`, …).
+
+1. It checks the current DB version via `schema_version`.
+2. It runs every migration newer than the current version inside a SQL transaction.
+3. For migrations that need data reshaping, it runs a Rust backfill procedure before commit.
+
+There are three migration kinds in code:
+* `schema_setup`: only for fresh DB setup, not allowed when upgrading an already populated DB.
+* `migration`: pure SQL migration that can run for setup and upgrades.
+* `migration_backfill`: SQL + Rust backfill for safe upgrades.
+
+Recent migrations (`v7+`) are applied for normal upgrades. `v9` is additive and creates a new `gateways` table plus indexes; it does not alter/drop existing tables.
+
 ## Federation Inspector
 The lesser-known component is an API under the `/config` path it can be used to get a JSON-encoded version of the
 federation config if you have an invite code. The first time it fetches the config from the federation using the invite
