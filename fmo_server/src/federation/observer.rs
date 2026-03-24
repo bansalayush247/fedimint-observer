@@ -1620,4 +1620,14 @@ mod tests {
         assert_eq!(last_7_days[6], now);
         assert_eq!(last_7_days[0], now - chrono::Duration::days(6));
     }
+
+    #[test]
+    fn v9_schema_is_additive_only() {
+        let migration = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/schema/v9.sql"));
+
+        assert!(migration.contains("CREATE TABLE gateways"));
+        assert!(!migration.contains("ALTER TABLE"));
+        assert!(!migration.contains("DROP TABLE"));
+        assert!(!migration.contains("CREATE TABLE IF NOT EXISTS gateways"));
+    }
 }
