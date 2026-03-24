@@ -37,7 +37,7 @@ There are three migration kinds in code:
 * `migration`: pure SQL migration that can run for setup and upgrades.
 * `migration_backfill`: SQL + Rust backfill for safe upgrades.
 
-Recent migrations (`v7+`) are applied for normal upgrades. `v9` is additive and creates a new `gateways` table plus indexes; it does not alter/drop existing tables.
+In the current code path, `v0`-`v6` are marked as `schema_setup` (fresh setup only), while `v7`, `v8`, and `v9` are upgrade-capable migrations for existing databases. `v9` is additive and creates a new `gateways` table plus indexes; it does not alter/drop existing tables.
 
 ## Federation Inspector
 The lesser-known component is an API under the `/config` path it can be used to get a JSON-encoded version of the

@@ -1623,11 +1623,13 @@ mod tests {
 
     #[test]
     fn v9_schema_is_additive_only() {
-        let migration = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/schema/v9.sql"));
+        let migration = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/schema/v9.sql")).to_lowercase();
 
-        assert!(migration.contains("CREATE TABLE gateways"));
-        assert!(!migration.contains("ALTER TABLE"));
-        assert!(!migration.contains("DROP TABLE"));
-        assert!(!migration.contains("CREATE TABLE IF NOT EXISTS gateways"));
+        assert!(migration.contains("create table gateways"));
+        assert!(migration.contains("create index if not exists gateways_federation_id"));
+        assert!(migration.contains("create index if not exists gateways_node_pub_key"));
+        assert!(!migration.contains("alter table"));
+        assert!(!migration.contains("drop table"));
+        assert!(!migration.contains("create table if not exists gateways"));
     }
 }
