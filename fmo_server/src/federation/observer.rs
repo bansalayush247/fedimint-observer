@@ -1620,4 +1620,16 @@ mod tests {
         assert_eq!(last_7_days[6], now);
         assert_eq!(last_7_days[0], now - chrono::Duration::days(6));
     }
+
+    #[test]
+    fn v9_schema_is_additive_only() {
+        let migration = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/schema/v9.sql")).to_lowercase();
+
+        assert!(migration.contains("create table gateways"));
+        assert!(migration.contains("create index if not exists gateways_federation_id"));
+        assert!(migration.contains("create index if not exists gateways_node_pub_key"));
+        assert!(!migration.contains("alter table"));
+        assert!(!migration.contains("drop table"));
+        assert!(!migration.contains("create table if not exists gateways"));
+    }
 }

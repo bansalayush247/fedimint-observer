@@ -5,7 +5,9 @@ INSERT INTO
 VALUES
     (9);
 
-CREATE TABLE IF NOT EXISTS gateways (
+-- V9 is intentionally additive: it creates a new table and indexes only.
+-- It must not modify or drop any existing production tables.
+CREATE TABLE gateways (
     federation_id   BYTEA        NOT NULL REFERENCES federations (federation_id),
     gateway_id      TEXT         NOT NULL,
     node_pub_key    TEXT         NOT NULL,
