@@ -42,6 +42,52 @@ pub struct FederationUtxo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationUtxosResponse {
+    pub observed: Vec<FederationUtxo>,
+    pub guardian_claims: Vec<GuardianUtxoClaim>,
+    pub disagreements: Vec<GuardianUtxoDisagreement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianUtxoClaim {
+    pub guardian_id: u16,
+    pub status: GuardianUtxoClaimStatus,
+    pub utxos: Vec<GuardianClaimedUtxo>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianUtxoClaimStatus {
+    Unavailable,
+    Ok,
+    Error,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct GuardianClaimedUtxo {
+    pub out_point: bitcoin::OutPoint,
+    pub amount: Amount,
+    pub state: GuardianClaimedUtxoState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianClaimedUtxoState {
+    Spendable,
+    UnsignedPegOut,
+    UnsignedChange,
+    UnconfirmedPegOut,
+    UnconfirmedChange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardianUtxoDisagreement {
+    pub out_point: bitcoin::OutPoint,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardianHealth {
     pub avg_uptime: f32,
     pub avg_latency: f32,

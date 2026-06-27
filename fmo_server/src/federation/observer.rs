@@ -1,18 +1,19 @@
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, OutPoint, Txid};
 use chrono::{DateTime, NaiveDate};
 use deadpool_postgres::{GenericClient, Runtime, Transaction};
 use fedimint_api_client::api::net::Connector;
-use fedimint_api_client::api::DynGlobalApi;
+use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::core::DynModuleConsensusItem;
 use fedimint_core::encoding::Encodable;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
+use fedimint_core::module::ApiRequestErased;
 use fedimint_core::session_outcome::SessionOutcome;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::util::backoff_util::background_backoff;
@@ -23,9 +24,13 @@ use fedimint_ln_common::{
     LightningConsensusItem, LightningInput, LightningOutput, LightningOutputV0,
 };
 use fedimint_mint_common::{MintConsensusItem, MintInput, MintOutput};
-use fedimint_wallet_common::{WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0};
+use fedimint_wallet_common::endpoint_constants::WALLET_SUMMARY_ENDPOINT;
+use fedimint_wallet_common::{
+    TxOutputSummary, WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0, WalletSummary,
+};
 use fmo_api_types::{
     FederationActivity, FederationHealth, FederationSummary, FederationUtxo, FedimintTotals,
+    GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus,
     NonceSpendInfo,
 };
 use futures::future::join_all;
@@ -1408,6 +1413,75 @@ impl FederationObserver {
         }).collect()
     }
 
+    pub async fn guardian_utxo_claims(
+        &self,
+        federation_id: FederationId,
+    ) -> anyhow::Result<Vec<GuardianUtxoClaim>> {
+        let federation = self
+            .get_federation(federation_id)
+            .await?
+            .context("Federation not observed")?;
+        let config = federation.config;
+
+        let Some(wallet_module_id) = config
+            .modules
+            .iter()
+            .find_map(|(id, module)| (module.kind.as_str() == "wallet").then_some(*id))
+        else {
+            return Ok(config
+                .global
+                .api_endpoints
+                .keys()
+                .map(|peer_id| GuardianUtxoClaim {
+                    guardian_id: peer_id.to_usize() as u16,
+                    status: GuardianUtxoClaimStatus::Unavailable,
+                    utxos: Vec::new(),
+                    error: Some("federation config has no wallet module".to_owned()),
+                })
+                .collect());
+        };
+
+        let api = DynGlobalApi::from_endpoints(
+            config
+                .global
+                .api_endpoints
+                .iter()
+                .map(|(peer_id, peer_url)| (*peer_id, peer_url.url.clone())),
+            &None,
+        )
+        .await?;
+
+        let module_api = api.with_module(wallet_module_id);
+        Ok(join_all(config.global.api_endpoints.keys().map(|peer_id| {
+            let module_api = module_api.clone();
+            let peer_id = *peer_id;
+            async move {
+                match module_api
+                    .request_single_peer::<WalletSummary>(
+                        WALLET_SUMMARY_ENDPOINT.to_owned(),
+                        ApiRequestErased::default(),
+                        peer_id,
+                    )
+                    .await
+                {
+                    Ok(summary) => GuardianUtxoClaim {
+                        guardian_id: peer_id.to_usize() as u16,
+                        status: GuardianUtxoClaimStatus::Ok,
+                        utxos: wallet_summary_claimed_utxos(summary),
+                        error: None,
+                    },
+                    Err(error) => GuardianUtxoClaim {
+                        guardian_id: peer_id.to_usize() as u16,
+                        status: GuardianUtxoClaimStatus::Error,
+                        utxos: Vec::new(),
+                        error: Some(error.to_string()),
+                    },
+                }
+            }
+        }))
+        .await)
+    }
+
     pub async fn totals(&self) -> anyhow::Result<FedimintTotals> {
         #[derive(Debug, FromRow)]
         struct FedimintTotalsResult {
@@ -1600,6 +1674,48 @@ impl FederationObserver {
 
         Ok(())
     }
+}
+
+fn wallet_summary_claimed_utxos(summary: WalletSummary) -> Vec<GuardianClaimedUtxo> {
+    let mut utxos = Vec::new();
+    append_claimed_utxos(
+        &mut utxos,
+        summary.spendable_utxos,
+        GuardianClaimedUtxoState::Spendable,
+    );
+    append_claimed_utxos(
+        &mut utxos,
+        summary.unsigned_peg_out_txos,
+        GuardianClaimedUtxoState::UnsignedPegOut,
+    );
+    append_claimed_utxos(
+        &mut utxos,
+        summary.unsigned_change_utxos,
+        GuardianClaimedUtxoState::UnsignedChange,
+    );
+    append_claimed_utxos(
+        &mut utxos,
+        summary.unconfirmed_peg_out_txos,
+        GuardianClaimedUtxoState::UnconfirmedPegOut,
+    );
+    append_claimed_utxos(
+        &mut utxos,
+        summary.unconfirmed_change_utxos,
+        GuardianClaimedUtxoState::UnconfirmedChange,
+    );
+    utxos
+}
+
+fn append_claimed_utxos(
+    utxos: &mut Vec<GuardianClaimedUtxo>,
+    txos: Vec<TxOutputSummary>,
+    state: GuardianClaimedUtxoState,
+) {
+    utxos.extend(txos.into_iter().map(|txo| GuardianClaimedUtxo {
+        out_point: txo.outpoint,
+        amount: Amount::from_sats(txo.amount.to_sat()),
+        state,
+    }));
 }
 
 fn last_n_day_iter(now: NaiveDate, days: u32) -> impl Iterator<Item = NaiveDate> {
