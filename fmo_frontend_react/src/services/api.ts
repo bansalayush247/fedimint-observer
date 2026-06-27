@@ -1,6 +1,7 @@
 import type {
   FedimintTotals,
   FederationSummary,
+  FederationUtxosResponse,
   GatewayInfo,
   GatewayWindow,
 } from '../types/api';
@@ -56,7 +57,7 @@ export const api = {
     return response.json();
   },
 
-  async getFederationUtxos(id: string): Promise<unknown[]> {
+  async getFederationUtxos(id: string): Promise<FederationUtxosResponse> {
     const response = await fetch(`${BASE_URL}/federations/${id}/utxos`);
     if (!response.ok) {
       throw new Error(`Failed to fetch UTXOs for federation ${id}`);

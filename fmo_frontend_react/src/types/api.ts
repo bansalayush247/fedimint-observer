@@ -30,6 +30,37 @@ export interface FederationUtxo {
   amount: number;
 }
 
+export interface FederationUtxosResponse {
+  observed: FederationUtxo[];
+  guardian_claims: GuardianUtxoClaim[];
+  disagreements: GuardianUtxoDisagreement[];
+}
+
+export interface GuardianUtxoClaim {
+  guardian_id: number;
+  status: 'unavailable' | 'ok' | 'error';
+  utxos: GuardianClaimedUtxo[];
+  error: string | null;
+}
+
+export interface GuardianClaimedUtxo {
+  out_point: string;
+  amount: number;
+  state: GuardianClaimedUtxoState;
+}
+
+export type GuardianClaimedUtxoState =
+  | 'spendable'
+  | 'unsigned_peg_out'
+  | 'unsigned_change'
+  | 'unconfirmed_peg_out'
+  | 'unconfirmed_change';
+
+export interface GuardianUtxoDisagreement {
+  out_point: string;
+  description: string;
+}
+
 export interface GatewayInfo {
   gateway_id: string;
   node_pub_key: string;
