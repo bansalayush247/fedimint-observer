@@ -47,6 +47,16 @@ export interface GuardianClaimedUtxo {
   out_point: string;
   amount: number;
   state: GuardianClaimedUtxoState;
+  onchain?: GuardianClaimedUtxoOnchain;
+  resolution_error?: string;
+}
+
+export interface GuardianClaimedUtxoOnchain {
+  script_pubkey: string;
+  address: string | null;
+  amount: number;
+  confirmed: boolean;
+  block_height: number | null;
 }
 
 export type GuardianClaimedUtxoState =

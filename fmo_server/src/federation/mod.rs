@@ -145,10 +145,14 @@ async fn get_federation_utxos(
         .federation_observer
         .federation_utxos(federation_id)
         .await?;
-    let guardian_claims = state
+    let mut guardian_claims = state
         .federation_observer
         .guardian_utxo_claims(federation_id)
         .await?;
+    state
+        .federation_observer
+        .enrich_guardian_claims_onchain(&mut guardian_claims)
+        .await;
     let disagreements = guardian_utxo_disagreements(&utxos, &guardian_claims);
     Ok(FederationUtxosResponse {
         observed: utxos,
@@ -164,7 +168,7 @@ fn guardian_utxo_disagreements(
 ) -> Vec<GuardianUtxoDisagreement> {
     let observed_by_outpoint = observed
         .iter()
-        .map(|utxo| (utxo.out_point, utxo.amount))
+        .map(|utxo| (utxo.out_point, utxo))
         .collect::<HashMap<_, _>>();
     let successful_claims = guardian_claims
         .iter()
@@ -200,6 +204,30 @@ fn guardian_utxo_disagreements(
 
     let mut disagreements = Vec::new();
 
+    for claim in &successful_claims {
+        for utxo in &claim.utxos {
+            if let Some(onchain) = &utxo.onchain {
+                if onchain.amount != utxo.amount {
+                    disagreements.push(GuardianUtxoDisagreement {
+                        out_point: utxo.out_point,
+                        description: format!(
+                            "guardian {} reports {} msat, but resolved Bitcoin output has {} msat",
+                            claim.guardian_id, utxo.amount.msats, onchain.amount.msats
+                        ),
+                    });
+                }
+            } else if let Some(error) = &utxo.resolution_error {
+                disagreements.push(GuardianUtxoDisagreement {
+                    out_point: utxo.out_point,
+                    description: format!(
+                        "could not resolve guardian {} claimed outpoint from Bitcoin data: {error}",
+                        claim.guardian_id
+                    ),
+                });
+            }
+        }
+    }
+
     for observed_utxo in observed {
         let Some(claims) = claimed_by_outpoint.get(&observed_utxo.out_point) else {
             disagreements.push(GuardianUtxoDisagreement {
@@ -227,6 +255,30 @@ fn guardian_utxo_disagreements(
                 ),
             });
         }
+
+        let observed_address = observed_utxo.address.clone().assume_checked().to_string();
+        let mismatched_addresses = claims
+            .iter()
+            .filter_map(|(guardian_id, claim)| {
+                claim
+                    .onchain
+                    .as_ref()
+                    .and_then(|onchain| onchain.address.as_ref())
+                    .filter(|address| *address != &observed_address)
+                    .map(|address| format!("guardian {guardian_id} resolves to address {address}"))
+            })
+            .collect::<Vec<_>>();
+
+        if !mismatched_addresses.is_empty() {
+            disagreements.push(GuardianUtxoDisagreement {
+                out_point: observed_utxo.out_point,
+                description: format!(
+                    "observer reconstructs address {}, but {}",
+                    observed_address,
+                    mismatched_addresses.join(", ")
+                ),
+            });
+        }
     }
 
     for (out_point, claims) in &claimed_by_outpoint {
@@ -236,10 +288,21 @@ fn guardian_utxo_disagreements(
                 .map(|(guardian_id, _)| guardian_id.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let onchain_hint = claims
+                .iter()
+                .find_map(|(_, claim)| claim.onchain.as_ref())
+                .map(|onchain| {
+                    format!(
+                        "; resolved script_pubkey: {}; address: {}",
+                        onchain.script_pubkey,
+                        onchain.address.as_deref().unwrap_or("non-standard")
+                    )
+                })
+                .unwrap_or_default();
             disagreements.push(GuardianUtxoDisagreement {
                 out_point: *out_point,
                 description: format!(
-                    "guardian wallet summary claims UTXO, but observer reconstruction does not; guardians: {guardian_ids}"
+                    "guardian wallet summary claims UTXO, but observer reconstruction does not; guardians: {guardian_ids}{onchain_hint}"
                 ),
             });
         }

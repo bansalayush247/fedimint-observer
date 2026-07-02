@@ -13,6 +13,13 @@
       let
         pkgs = import nixpkgs {
           inherit system;
+          overlays = [
+            (final: prev: {
+              nodePackages = {
+                bash-language-server = final.bash-language-server;
+              };
+            })
+          ];
         };
         flakeboxLib = flakebox.lib.mkLib pkgs { };
         lib = pkgs.lib;
