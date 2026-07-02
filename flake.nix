@@ -13,6 +13,13 @@
       let
         pkgs = import nixpkgs {
           inherit system;
+          overlays = [
+            (final: prev: {
+              nodePackages = {
+                bash-language-server = final.bash-language-server;
+              };
+            })
+          ];
         };
         flakeboxLib = flakebox.lib.mkLib pkgs { };
         lib = pkgs.lib;
@@ -33,7 +40,7 @@
               wasm-pack
               trunk
               nodejs
-              nodePackages.tailwindcss
+              tailwindcss
             ];
           };
           targets = (pkgs.lib.getAttrs
@@ -130,7 +137,7 @@
                 wasm-pack
                 nodejs
                 binaryen
-                nodePackages.tailwindcss
+                tailwindcss
               ];
 
               FMO_API_SERVER = api;

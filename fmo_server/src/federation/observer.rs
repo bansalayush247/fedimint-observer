@@ -1,8 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, ensure, Context};
 use bitcoin::hashes::Hash;
+use bitcoin::hex::DisplayHex as _;
 use bitcoin::{Address, OutPoint, Txid};
 use chrono::{DateTime, NaiveDate};
 use deadpool_postgres::{GenericClient, Runtime, Transaction};
@@ -30,8 +32,8 @@ use fedimint_wallet_common::{
 };
 use fmo_api_types::{
     FederationActivity, FederationHealth, FederationSummary, FederationUtxo, FedimintTotals,
-    GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus,
-    NonceSpendInfo,
+    GuardianClaimedUtxo, GuardianClaimedUtxoOnchain, GuardianClaimedUtxoState, GuardianUtxoClaim,
+    GuardianUtxoClaimStatus, NonceSpendInfo,
 };
 use futures::future::join_all;
 use futures::StreamExt;
@@ -1482,6 +1484,139 @@ impl FederationObserver {
         .await)
     }
 
+    pub async fn enrich_guardian_claims_onchain(&self, guardian_claims: &mut [GuardianUtxoClaim]) {
+        let outpoints = guardian_claims
+            .iter()
+            .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Ok))
+            .flat_map(|claim| claim.utxos.iter().map(|utxo| utxo.out_point))
+            .collect::<HashSet<_>>();
+
+        if outpoints.is_empty() {
+            return;
+        }
+
+        let resolutions = self.resolve_onchain_outpoints(outpoints).await;
+        for claim in guardian_claims {
+            for utxo in &mut claim.utxos {
+                if let Some(resolution) = resolutions.get(&utxo.out_point) {
+                    match resolution {
+                        Ok(onchain) => {
+                            utxo.onchain = Some(onchain.clone());
+                            utxo.resolution_error = None;
+                        }
+                        Err(error) => {
+                            utxo.onchain = None;
+                            utxo.resolution_error = Some(error.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn resolve_onchain_outpoints(
+        &self,
+        outpoints: HashSet<OutPoint>,
+    ) -> HashMap<OutPoint, Result<GuardianClaimedUtxoOnchain, String>> {
+        let mut outpoints_by_txid = HashMap::<Txid, Vec<OutPoint>>::new();
+        for outpoint in outpoints {
+            outpoints_by_txid
+                .entry(outpoint.txid)
+                .or_default()
+                .push(outpoint);
+        }
+
+        let client = match esplora_client::Builder::new(&self.mempool_url).build_async() {
+            Ok(client) => client,
+            Err(error) => {
+                return outpoints_by_txid
+                    .into_values()
+                    .flatten()
+                    .into_iter()
+                    .map(|outpoint| {
+                        (
+                            outpoint,
+                            Err(format!("failed to create Esplora client: {error}")),
+                        )
+                    })
+                    .collect();
+            }
+        };
+
+        join_all(outpoints_by_txid.into_iter().map(|(txid, outpoints)| {
+            let client = client.clone();
+            async move {
+                let tx = match client.get_tx_no_opt(&txid).await {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        return outpoints
+                            .into_iter()
+                            .map(|outpoint| {
+                                (
+                                    outpoint,
+                                    Err(format!("failed to fetch transaction: {error}")),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                    }
+                };
+
+                let status = match client.get_tx_status(&txid).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        return outpoints
+                            .into_iter()
+                            .map(|outpoint| {
+                                (
+                                    outpoint,
+                                    Err(format!("failed to fetch transaction status: {error}")),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                    }
+                };
+
+                outpoints
+                    .into_iter()
+                    .map(|outpoint| {
+                        let result = tx
+                            .output
+                            .get(outpoint.vout as usize)
+                            .ok_or_else(|| {
+                                format!("transaction does not have vout {}", outpoint.vout)
+                            })
+                            .map(|output| {
+                                let address = Address::from_script(
+                                    &output.script_pubkey,
+                                    bitcoin::Network::Bitcoin,
+                                )
+                                .ok()
+                                .map(|address| address.to_string());
+
+                                GuardianClaimedUtxoOnchain {
+                                    script_pubkey: output
+                                        .script_pubkey
+                                        .as_bytes()
+                                        .as_hex()
+                                        .to_string(),
+                                    address,
+                                    amount: Amount::from_sats(output.value.to_sat()),
+                                    confirmed: status.confirmed,
+                                    block_height: status.block_height,
+                                }
+                            });
+
+                        (outpoint, result)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     pub async fn totals(&self) -> anyhow::Result<FedimintTotals> {
         #[derive(Debug, FromRow)]
         struct FedimintTotalsResult {
@@ -1715,6 +1850,8 @@ fn append_claimed_utxos(
         out_point: txo.outpoint,
         amount: Amount::from_sats(txo.amount.to_sat()),
         state,
+        onchain: None,
+        resolution_error: None,
     }));
 }
 

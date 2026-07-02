@@ -775,11 +775,41 @@ export function FederationDetail() {
                                 <div className="mt-3 space-y-2">
                                   {visibleUtxos.map((utxo) => (
                                     <div key={`${claim.guardian_id}-${utxo.out_point}`} className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 rounded-md bg-gray-50 dark:bg-gray-900/50 px-2 py-2">
-                                      <div className="font-mono text-[10px] sm:text-xs text-blue-600 dark:text-blue-400 break-all">
-                                        {utxo.out_point}
+                                      <div className="min-w-0">
+                                        <a
+                                          href={mempoolTxUrl(utxo.out_point)}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="font-mono text-[10px] sm:text-xs text-blue-600 underline dark:text-blue-400 hover:no-underline break-all"
+                                        >
+                                          {utxo.out_point}
+                                        </a>
+                                        {utxo.onchain?.address && (
+                                          <a
+                                            href={mempoolAddressUrl(utxo.onchain.address)}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="mt-1 block font-mono text-[10px] sm:text-xs text-gray-500 underline dark:text-gray-400 hover:no-underline break-all"
+                                          >
+                                            {utxo.onchain.address}
+                                          </a>
+                                        )}
+                                        {utxo.onchain && !utxo.onchain.address && (
+                                          <div className="mt-1 font-mono text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 break-all">
+                                            script {utxo.onchain.script_pubkey}
+                                          </div>
+                                        )}
+                                        {utxo.resolution_error && (
+                                          <div className="mt-1 text-[10px] sm:text-xs text-red-600 dark:text-red-400 break-words">
+                                            {utxo.resolution_error}
+                                          </div>
+                                        )}
                                       </div>
                                       <div className="flex items-center gap-2 text-[10px] sm:text-xs text-gray-600 dark:text-gray-400 shrink-0">
                                         <span>{formatUtxoState(utxo.state)}</span>
+                                        {utxo.onchain && (
+                                          <span>{utxo.onchain.confirmed ? `Block ${utxo.onchain.block_height ?? 'confirmed'}` : 'Unconfirmed'}</span>
+                                        )}
                                         <span className="font-mono text-gray-900 dark:text-white">
                                           {formatMsatsAsBtc(utxo.amount)}
                                         </span>
@@ -851,13 +881,22 @@ export function FederationDetail() {
                           <div className="flex-1 min-w-0">
                             <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">UTXO</span>
                             <a
-                              href={`https://mempool.space/address/${utxo.address}`}
+                              href={mempoolTxUrl(utxo.out_point)}
                               target="_blank"
                               rel="noopener noreferrer"
                               className="text-blue-600 underline dark:text-blue-500 hover:no-underline font-mono text-[10px] sm:text-xs block truncate"
                               title={utxo.out_point}
                             >
                               {utxo.out_point}
+                            </a>
+                            <a
+                              href={mempoolAddressUrl(utxo.address)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="mt-1 text-gray-500 underline dark:text-gray-400 hover:no-underline font-mono text-[10px] sm:text-xs block truncate"
+                              title={utxo.address}
+                            >
+                              {utxo.address}
                             </a>
                           </div>
                           <div className="sm:text-right shrink-0">
@@ -890,6 +929,15 @@ export function FederationDetail() {
 
 function formatMsatsAsBtc(msats: number): string {
   return `${(msats / MSATS_PER_BTC).toFixed(8)} BTC`;
+}
+
+function mempoolTxUrl(outPoint: string): string {
+  const [txid] = outPoint.split(':');
+  return `https://mempool.space/tx/${txid}`;
+}
+
+function mempoolAddressUrl(address: string): string {
+  return `https://mempool.space/address/${address}`;
 }
 
 function formatUtxoState(state: string): string {
