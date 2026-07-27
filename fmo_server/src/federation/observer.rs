@@ -1184,11 +1184,8 @@ impl FederationObserver {
                 .await?;
             }
             WalletConsensusItem::PegOutSignature(peg_out_sig) => {
-                let peg_out_txid = peg_out_sig.txid.to_string();
-                let peg_out_txid_encoded =
-                    fedimint_core::TransactionId::from_str(peg_out_txid.as_str())
-                        .expect("Invalid on chain txid")
-                        .consensus_encode_to_vec();
+                let peg_out_txid = peg_out_sig.txid;
+                let peg_out_txid_encoded = peg_out_txid.to_byte_array().to_vec();
 
                 dbtx.execute(
                     "INSERT INTO wallet_withdrawal_transactions VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1237,7 +1234,7 @@ impl FederationObserver {
 
                 // at this point, the transaction reached threshold and should broadcast
 
-                let esplora_txid = esplora_client::Txid::from_str(peg_out_txid.as_str())
+                let esplora_txid = esplora_client::Txid::from_str(&peg_out_txid.to_string())
                     .expect("Couldn't create esplora txid");
 
                 let builder = esplora_client::Builder::new(mempool_url);
@@ -1259,11 +1256,7 @@ impl FederationObserver {
                 .expect("Reached usize::MAX retries");
 
                 for input in fetched_tx.input {
-                    let prev_out_txid = fedimint_core::TransactionId::from_str(
-                        input.previous_output.txid.to_string().as_str(),
-                    )
-                    .expect("Invalid txid")
-                    .consensus_encode_to_vec();
+                    let prev_out_txid = input.previous_output.txid.to_byte_array().to_vec();
 
                     dbtx.execute(
                         "INSERT INTO wallet_withdrawal_transaction_inputs VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
