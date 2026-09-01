@@ -16,7 +16,6 @@
         };
         flakeboxLib = flakebox.lib.mkLib pkgs { };
         lib = pkgs.lib;
-        stdenv = pkgs.stdenv;
 
         toolchains = flakeboxLib.mkFenixToolchain {
           components = [
@@ -216,8 +215,6 @@
             # sqlite is used only for creating the dump file for migrating existing instances
             pkgs.sqlite
             pkgs.nixpkgs-fmt
-          ] ++ lib.optionals stdenv.isDarwin [
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
           ];
 
           shellHook = ''
