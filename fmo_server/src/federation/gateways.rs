@@ -76,15 +76,16 @@ pub(super) struct GetFederationGatewaysParams {
 pub(crate) async fn fetch_gateways_for_config(
     config: &ClientConfig,
 ) -> anyhow::Result<Vec<GatewayInfo>> {
-    let api = DynGlobalApi::from_endpoints(
-        config
-            .global
-            .api_endpoints
-            .iter()
-            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone())),
-        &None,
-    )
-    .await?;
+    let connectors = fedimint_connectors::ConnectorRegistry::build_from_client_env()?
+        .bind()
+        .await?;
+    let peers = config
+        .global
+        .api_endpoints
+        .iter()
+        .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
+        .collect();
+    let api = DynGlobalApi::new(connectors, peers, None)?;
 
     let ln_instance_id = config
         .modules
@@ -161,15 +162,13 @@ impl FederationObserver {
     ) -> anyhow::Result<()> {
         const POLL_INTERVAL: Duration = Duration::from_secs(GATEWAY_POLL_INTERVAL_MINUTES * 60);
 
-        let api = DynGlobalApi::from_endpoints(
-            config
-                .global
-                .api_endpoints
-                .iter()
-                .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone())),
-            &None,
-        )
-        .await?;
+        let peers = config
+            .global
+            .api_endpoints
+            .iter()
+            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
+            .collect();
+        let api = DynGlobalApi::new(self.connectors().clone(), peers, None)?;
 
         let ln_instance_id = config
             .modules
