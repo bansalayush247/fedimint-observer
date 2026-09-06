@@ -24,6 +24,7 @@ interface Guardian {
 interface GuardianHealth {
   avg_uptime: number;
   avg_latency: number;
+  software_version: string | null;
   latest: {
     block_height: number;
     block_outdated: boolean;
@@ -359,6 +360,7 @@ export function FederationDetail() {
                 const block = health?.latest ? health.latest.block_height - 1 : 0;
                 const sessionOutdated = health?.latest?.session_outdated || false;
                 const blockOutdated = health?.latest?.block_outdated || false;
+                const softwareVersion = health?.software_version || 'Version unknown';
 
                 return (
                   <div key={guardian.id} className="border-b border-gray-200 dark:border-gray-700 pb-3 sm:pb-4 last:border-0">
@@ -377,6 +379,9 @@ export function FederationDetail() {
                         <>
                           <Badge level={isOnline ? 'success' : 'error'}>
                             {isOnline ? 'Online' : 'Offline'}
+                          </Badge>
+                          <Badge level="info">
+                            {softwareVersion}
                           </Badge>
                           {isOnline && (
                             <>
