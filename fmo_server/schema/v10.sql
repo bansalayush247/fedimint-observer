@@ -32,4 +32,7 @@ CREATE TABLE IF NOT EXISTS gateway_poll_snapshots (
 CREATE INDEX IF NOT EXISTS gateway_poll_snapshots_fed_time
     ON gateway_poll_snapshots (federation_id, poll_time);
 
+ALTER TABLE guardian_health
+    ADD COLUMN IF NOT EXISTS software_version TEXT;
+
 COMMIT;

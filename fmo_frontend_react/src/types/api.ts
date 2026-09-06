@@ -65,6 +65,7 @@ export type GatewayWindow = '1h' | '24h' | '7d' | '30d' | '90d';
 export interface GuardianHealth {
   avg_uptime: number;
   avg_latency: number;
+  software_version: string | null;
   latest: GuardianHealthLatest | null;
 }
 
