@@ -13,13 +13,6 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [
-            (final: prev: {
-              nodePackages = {
-                bash-language-server = final.bash-language-server;
-              };
-            })
-          ];
         };
         flakeboxLib = flakebox.lib.mkLib pkgs { };
         lib = pkgs.lib;
@@ -30,6 +23,7 @@
             "cargo"
             "clippy"
             "rust-analyzer"
+            "rustfmt"
             "rust-src"
           ];
 
@@ -147,8 +141,11 @@
           };
       in
       {
-        devShells = flakeboxLib.mkShells {
-          toolchain = toolchains;
+        devShells.default = pkgs.mkShell {
+          packages = [
+            toolchains.toolchain
+            pkgs.nodejs
+          ];
 
           nativeBuildInputs = [
             pkgs.postgresql
@@ -157,7 +154,11 @@
             pkgs.nixpkgs-fmt
             # cmake is required for building aws-lc-sys (fedimint dependency)
             pkgs.cmake
-          ];
+          ] ++ (toolchains.toolchain.nativeBuildInputs or [ ]);
+
+          buildInputs = lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+          ] ++ (toolchains.toolchain.buildInputs or [ ]);
 
           shellHook = ''
             source scripts/pg_dev/env.sh
