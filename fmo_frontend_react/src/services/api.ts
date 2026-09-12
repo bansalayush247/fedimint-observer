@@ -2,6 +2,7 @@ import type {
   FedimintTotals,
   FederationSummary,
   GatewayInfo,
+  GatewayUptimeTrendPoint,
   GatewayWindow,
 } from '../types/api';
 
@@ -32,59 +33,24 @@ export const api = {
     return response.json();
   },
 
-  async getFederation(id: string): Promise<FederationSummary> {
-    const response = await fetch(`${BASE_URL}/federations/${id}`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch federation ${id}`);
-    }
-    // The backend returns overview data, but we need full summary
-    // So we still fetch from the list and find it
-    // TODO: Backend should provide a full federation detail endpoint
-    const allFederations = await this.getFederations();
-    const federation = allFederations.find(f => f.id === id);
-    if (!federation) {
-      throw new Error(`Federation ${id} not found`);
-    }
-    return federation;
-  },
-
-  async getFederationConfig(id: string): Promise<Record<string, unknown>> {
-    const response = await fetch(`${BASE_URL}/federations/${id}/config`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch config for federation ${id}`);
-    }
-    return response.json();
-  },
-
-  async getFederationUtxos(id: string): Promise<unknown[]> {
-    const response = await fetch(`${BASE_URL}/federations/${id}/utxos`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch UTXOs for federation ${id}`);
-    }
-    return response.json();
-  },
-
-  async getFederationHistogram(id: string): Promise<Record<string, { num_transactions: number; amount_transferred: number }>> {
-    const response = await fetch(`${BASE_URL}/federations/${id}/transactions/histogram`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch histogram for federation ${id}`);
-    }
-    return response.json();
-  },
-
-  async getFederationHealth(id: string): Promise<Record<string, unknown>> {
-    const response = await fetch(`${BASE_URL}/federations/${id}/health`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch health for federation ${id}`);
-    }
-    return response.json();
-  },
-
   async getFederationGateways(id: string, window?: GatewayWindow): Promise<GatewayInfo[]> {
     const query = window ? `?window=${encodeURIComponent(window)}` : '';
     const response = await fetch(`${BASE_URL}/federations/${id}/gateways${query}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch gateways for federation ${id} (${response.status})`);
+    }
+    return response.json();
+  },
+
+  async getFederationGatewayUptimeTrend(
+    id: string,
+    window: GatewayWindow,
+  ): Promise<GatewayUptimeTrendPoint[]> {
+    const response = await fetch(
+      `${BASE_URL}/federations/${id}/gateways/uptime-trend?window=${encodeURIComponent(window)}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch gateway uptime trend (${response.status})`);
     }
     return response.json();
   },

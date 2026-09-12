@@ -20,7 +20,7 @@ use fmo_api_types::{FederationSummary, FedimintTotals, NonceSpendInfo, NoncesReq
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::federation::gateways::get_federation_gateways;
+use crate::federation::gateways::{get_federation_gateway_uptime_trend, get_federation_gateways};
 use crate::federation::guardians::get_federation_health;
 use crate::federation::meta::get_federation_meta;
 use crate::federation::session::{count_sessions, list_sessions};
@@ -58,6 +58,10 @@ pub fn get_federations_routes() -> Router<AppState> {
             get(transaction_histogram),
         )
         .route("/:federation_id/gateways", get(get_federation_gateways))
+        .route(
+            "/:federation_id/gateways/uptime-trend",
+            get(get_federation_gateway_uptime_trend),
+        )
         .route("/:federation_id/utxos", get(get_federation_utxos))
         .route("/:federation_id/sessions", get(list_sessions))
         .route("/:federation_id/sessions/count", get(count_sessions))

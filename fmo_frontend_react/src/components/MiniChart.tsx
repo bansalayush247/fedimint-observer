@@ -24,15 +24,6 @@ type TooltipParamItem = {
 };
 type ItemParam = { dataIndex: number };
 
-interface MiniChartProps {
-  data: number[];
-  color: string;
-  label: string;
-  value: string;
-  dates?: string[];
-  formatValue?: (value: number) => string;
-}
-
 interface CombinedMiniChartProps {
   transactionData: number[];
   volumeData: number[];
@@ -41,100 +32,6 @@ interface CombinedMiniChartProps {
   formatVolume?: (value: number) => string;
   maxTransaction?: number;  // global max for consistent scale across all charts
   maxVolume?: number;        // global max for consistent scale across all charts
-}
-
-export function MiniChart({ data, color, label, value, dates, formatValue }: MiniChartProps) {
-  const { theme } = useTheme();
-  
-  const sevenDayAvg = useMemo(() => {
-    if (data.length === 0) return 0;
-    const last7Days = data.slice(-7);
-    const sum = last7Days.reduce((acc, val) => acc + val, 0);
-    return sum / last7Days.length;
-  }, [data]);
-
-  const chartOption = useMemo(() => ({
-    grid: {
-      left: 0,
-      right: 0,
-      top: 0,
-      bottom: 0,
-    },
-    legend: {
-      show: false,
-    },
-    xAxis: {
-      type: 'category',
-      show: false,
-      data: dates || data.map((_, i) => `Day ${i + 1}`),
-    },
-    yAxis: {
-      type: 'value',
-      show: false,
-    },
-    tooltip: {
-      trigger: 'axis',
-      backgroundColor: theme === 'dark' ? '#1f2937' : '#ffffff',
-      borderColor: theme === 'dark' ? '#374151' : '#e5e7eb',
-      textStyle: { 
-        color: theme === 'dark' ? '#fff' : '#111827', 
-        fontSize: 11 
-      },
-      formatter: (params: unknown) => {
-        const p = params as TooltipParamItem[];
-        if (!p || p.length === 0) return '';
-        const param = p[0];
-        const dateStr = param.axisValue || '';
-        const val = param.value;
-        const formattedValue = formatValue ? formatValue(val as number) : (val !== undefined ? val.toString() : '');
-        const formattedAvg = formatValue ? formatValue(sevenDayAvg) : sevenDayAvg.toFixed(2);
-        const subtextColor = theme === 'dark' ? '#9ca3af' : '#6b7280';
-        return `<div style="font-size: 11px;">
-          <div style="color: ${subtextColor}; margin-bottom: 2px;">${dateStr}</div>
-          <div style="font-weight: 600;">${label}: ${formattedValue}</div>
-          <div style="color: ${subtextColor}; margin-top: 4px; font-size: 10px;">7-day avg: ${formattedAvg}</div>
-        </div>`;
-      },
-      axisPointer: {
-        type: 'line',
-        lineStyle: {
-          color: color,
-          width: 1,
-          type: 'solid',
-        },
-      },
-    },
-    series: [
-      {
-        type: 'bar',
-        data: data,
-        itemStyle: {
-          color: color,
-          borderRadius: [2, 2, 0, 0],
-        },
-        barWidth: '60%',
-      },
-    ],
-  }), [data, color, dates, formatValue, label, sevenDayAvg, theme]);
-
-  return (
-    <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-      <div className="flex-1">
-        <div className="text-xs text-gray-600 dark:text-gray-400">{label}</div>
-        <div className="text-sm font-medium text-gray-900 dark:text-white">{value}</div>
-      </div>
-      <div className="w-24 h-12 sm:w-32 sm:h-12">
-        <ReactEChartsCore
-          echarts={echarts}
-          option={chartOption}
-          notMerge={true}
-          lazyUpdate={true}
-          style={{ height: '100%', width: '100%' }}
-          opts={{ renderer: 'canvas' }}
-        />
-      </div>
-    </div>
-  );
 }
 
 export function CombinedMiniChart({ 
