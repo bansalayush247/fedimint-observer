@@ -23,7 +23,6 @@
             "cargo"
             "clippy"
             "rust-analyzer"
-            "rustfmt"
             "rust-src"
           ];
 
@@ -42,17 +41,14 @@
           );
         };
 
-        rustSrc = flakeboxLib.filterSubPaths {
-          root = builtins.path {
-            name = "fmo";
-            path = ./.;
-          };
-          paths = [
-            "Cargo.toml"
-            "Cargo.lock"
-            ".cargo"
-            "fmo_api_types"
-            "fmo_server"
+        rustSrc = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            (lib.fileset.maybeMissing ./.cargo)
+            ./fmo_api_types
+            ./fmo_server
           ];
         };
 
@@ -141,11 +137,8 @@
           };
       in
       {
-        devShells.default = pkgs.mkShell {
-          packages = [
-            toolchains.toolchain
-            pkgs.nodejs
-          ];
+        devShells = flakeboxLib.mkShells {
+          toolchain = toolchains;
 
           nativeBuildInputs = [
             pkgs.postgresql
@@ -154,11 +147,7 @@
             pkgs.nixpkgs-fmt
             # cmake is required for building aws-lc-sys (fedimint dependency)
             pkgs.cmake
-          ] ++ (toolchains.toolchain.nativeBuildInputs or [ ]);
-
-          buildInputs = lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.libiconv
-          ] ++ (toolchains.toolchain.buildInputs or [ ]);
+          ];
 
           shellHook = ''
             source scripts/pg_dev/env.sh

@@ -133,16 +133,16 @@ export function FederationDetail() {
       .forEach((claim) => claim.utxos
         .filter((utxo) => utxo.state !== 'unsigned_peg_out' && utxo.state !== 'unconfirmed_peg_out')
         .forEach((utxo) => {
-        const existing = guardianClaimsByOutpoint.get(utxo.out_point);
-        if (existing) {
-          existing.guardianIds.add(claim.guardian_id);
-        } else {
-          guardianClaimsByOutpoint.set(utxo.out_point, {
-            utxo,
-            guardianIds: new Set([claim.guardian_id]),
-          });
-        }
-      }));
+          const existing = guardianClaimsByOutpoint.get(utxo.out_point);
+          if (existing) {
+            existing.guardianIds.add(claim.guardian_id);
+          } else {
+            guardianClaimsByOutpoint.set(utxo.out_point, {
+              utxo,
+              guardianIds: new Set([claim.guardian_id]),
+            });
+          }
+        }));
 
     const outpoints = new Set([
       ...observedByOutpoint.keys(),
@@ -194,21 +194,30 @@ export function FederationDetail() {
             kind: unverified ? 'unverified' : 'reconciliation',
             detail: unverified
               ? 'Awaiting a guardian wallet summary before reconciliation can run.'
-              : 'Observed but not claimed by a successful guardian.',
+              : 'Observed by history, but not claimed by a successful guardian.',
             bitcoinStatus: bitcoinConfirmationLabel(guardianClaim?.utxo),
           };
         }
 
         return {
           outPoint,
-          amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
-          address: observed?.address ?? guardianClaim?.utxo.onchain?.address ?? null,
+          amount: observed?.amount ?? guardianClaim.utxo.amount,
+          address: observed?.address ?? guardianClaim.utxo.onchain?.address ?? null,
           guardianCount,
           kind: 'matched',
-          bitcoinStatus: bitcoinConfirmationLabel(guardianClaim?.utxo),
+          bitcoinStatus: bitcoinConfirmationLabel(guardianClaim.utxo),
         };
       })
-      .sort((left, right) => left.outPoint.localeCompare(right.outPoint));
+      .sort((left, right) => {
+        const kindOrder: Record<UtxoInventoryRow['kind'], number> = {
+          exception: 0,
+          reconciliation: 1,
+          guardian_confirmed: 2,
+          unverified: 3,
+          matched: 4,
+        };
+        return kindOrder[left.kind] - kindOrder[right.kind] || right.amount - left.amount;
+      });
   }, [guardianUtxoClaims, integrityDisagreementsByOutpoint, observerOnlyOutpoints, successfulGuardianCount, utxos]);
 
   const utxoCounts = useMemo(() => ({
@@ -225,9 +234,8 @@ export function FederationDetail() {
     [utxoInventory, utxoView]
   );
 
-  const guardianSummaryUnavailable = guardianUtxoClaims.length > 0 && successfulGuardianCount === 0;
-
   const visibleUtxos = filteredUtxos.slice(0, utxoLimit);
+  const guardianSummaryUnavailable = guardianUtxoClaims.length > 0 && successfulGuardianCount === 0;
 
   useEffect(() => {
     setUtxoLimit(25);
@@ -396,6 +404,9 @@ export function FederationDetail() {
       setUtxoDisagreements(data.disagreements);
     } catch (err) {
       console.error('Failed to fetch UTXOs:', err);
+      setUtxos([]);
+      setGuardianUtxoClaims([]);
+      setUtxoDisagreements([]);
     } finally {
       setUtxosLoading(false);
     }
@@ -847,6 +858,7 @@ export function FederationDetail() {
                     {successfulGuardianCount} of {guardianUtxoClaims.length} guardian responses available
                   </div>
                 </div>
+
                 {guardianSummaryUnavailable && (
                   <div className="border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200 sm:px-6">
                     Guardian wallet summaries are unavailable, so reconciliation results cannot be verified yet.
@@ -880,6 +892,7 @@ export function FederationDetail() {
                   <div className="hidden sm:block">Status</div>
                   <div>Amount</div>
                 </div>
+
                 <div className="divide-y divide-gray-200 dark:divide-gray-700">
                   {utxosLoading ? (
                     <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
@@ -929,6 +942,7 @@ export function FederationDetail() {
                     ))
                   )}
                 </div>
+
                 {visibleUtxos.length < filteredUtxos.length && (
                   <div className="border-t border-gray-200 px-4 py-3 dark:border-gray-700 sm:px-6">
                     <button
@@ -962,7 +976,7 @@ function formatMsatsAsBtc(msats: number): string {
 }
 
 function mempoolTxUrl(outPoint: string): string {
-  const [txid] = outPoint.split(':');
+  const txid = outPoint.split(':')[0] ?? outPoint;
   return `https://mempool.space/tx/${txid}`;
 }
 
@@ -972,16 +986,15 @@ function mempoolAddressUrl(address: string): string {
 
 function bitcoinConfirmationLabel(utxo?: GuardianClaimedUtxo): string | undefined {
   if (!utxo?.onchain) {
-    return undefined;
+    return utxo?.resolution_error ? `Bitcoin lookup failed: ${utxo.resolution_error}` : undefined;
   }
-  if (!utxo.onchain.confirmed) {
-    return 'Bitcoin transaction is unconfirmed.';
-  }
-  return utxo.onchain.block_height === null
-    ? 'Confirmed on Bitcoin.'
-    : `Confirmed on Bitcoin at block ${utxo.onchain.block_height}.`;
-}
 
+  if (!utxo.onchain.confirmed) {
+    return 'Bitcoin output is unconfirmed';
+  }
+
+  return utxo.onchain.block_height ? `Confirmed at block ${utxo.onchain.block_height}` : 'Confirmed on Bitcoin';
+}
 
 async function fetchFederationConfig(federationId: string, inviteCode: string): Promise<FederationConfig> {
   const BASE_URL = import.meta.env.VITE_FMO_API_BASE_URL || 'https://observer.fedimint.org/api';

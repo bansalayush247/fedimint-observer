@@ -204,9 +204,11 @@ impl FederationObserver {
         Ok(health_rows
             .into_iter()
             .map(|row| {
-                let latest = if row.session_count.is_some() && row.block_height.is_some() {
-                    let block_height = row.block_height.expect("checked above") as u32;
-                    let session_count = row.session_count.expect("checked above") as u32;
+                let latest = if let (Some(session_count), Some(block_height)) =
+                    (row.session_count, row.block_height)
+                {
+                    let block_height = block_height as u32;
+                    let session_count = session_count as u32;
                     Some(GuardianHealthLatest {
                         block_height,
                         block_outdated: our_block_height.saturating_sub(block_height) > 6,
@@ -294,9 +296,15 @@ impl FederationObserver {
                         .map_err(|_| anyhow!("Invalid federation id in DB"))?,
                 ));
 
-                // Special case single guardian federations to not show them as degraded
                 if federation.guardians == 1 {
-                    return Ok((federation_id, FederationHealth::Online));
+                    return Ok((
+                        federation_id,
+                        if federation.online_guardians == 1 {
+                            FederationHealth::Online
+                        } else {
+                            FederationHealth::Offline
+                        },
+                    ));
                 }
 
                 let threshold = NumPeers::from(federation.guardians as usize).threshold();

@@ -80,9 +80,7 @@ unspent_change AS (
   AND NOT EXISTS (
     SELECT *
     FROM wallet_withdrawal_addresses wwa
-    WHERE wwa.federation_id = wwt.federation_id
-      AND wwa.txid = wwt.federation_txid
-      AND wwto.address = wwa.address
+    WHERE wwto.address = wwa.address
   )
 )
 SELECT ud.on_chain_txid, ud.on_chain_vout, ud.address, ud.amount_msat, ud.federation_id

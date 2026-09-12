@@ -99,10 +99,6 @@ impl FederationObserver {
             .spawn_cancellable("sync nostr events", Self::sync_nostr_events(slf.clone()));
         slf.task_group
             .spawn_cancellable("refresh views", Self::refresh_views(slf.clone()));
-        slf.task_group.spawn_cancellable(
-            "reconcile wallet utxos",
-            Self::reconcile_wallet_utxos(slf.clone()),
-        );
 
         Ok(slf)
     }
@@ -230,10 +226,6 @@ impl FederationObserver {
             ),
             migration!("/schema/v9.sql"),
             migration!("/schema/v10.sql"),
-            migration!("/schema/v11.sql"),
-            migration!("/schema/v12.sql"),
-            migration!("/schema/v13.sql"),
-            migration!("/schema/v14.sql"),
         ];
 
         for (index, migration) in migrations.iter().enumerate() {
@@ -589,44 +581,35 @@ impl FederationObserver {
         let api = DynGlobalApi::new(self.connectors.clone(), peers, None)?;
         let decoders = decoders_from_config(&config);
 
-        let missing_sessions = self.missing_federation_sessions(federation_id).await?;
-        let next_session = self.next_federation_session_index(federation_id).await?;
-        if let (Some(first_missing), Some(last_missing)) =
-            (missing_sessions.first(), missing_sessions.last())
-        {
-            info!(
-                "Repairing {} missing federation sessions from {first_missing} through {last_missing}",
-                missing_sessions.len()
-            );
-        }
-        info!("Starting federation session sync for {federation_id} at session {next_session}");
+        info!("Starting background job for {federation_id}");
+        let next_session = self.federation_session_count(federation_id).await?;
+        debug!("Next session {next_session}");
         let api_fetch = api.clone();
-        let mut session_stream =
-            futures::stream::iter(missing_sessions.into_iter().chain(next_session..))
-                .map(move |session_index| {
-                    debug!("Starting fetch job for session {session_index}");
-                    let api_fetch_single = api_fetch.clone();
-                    let decoders_single = decoders.clone();
-                    async move {
-                        let signed_session_outcome = retry(
-                            format!("Waiting for session {session_index}"),
-                            background_backoff(),
-                            || async {
-                                api_fetch_single
-                                    .await_block(session_index, &decoders_single)
-                                    .await
-                            },
-                        )
-                        .await
-                        .expect("Will fail after 136 years");
-                        debug!("Finished fetch job for session {session_index}");
-                        (session_index, signed_session_outcome)
-                    }
-                })
-                .buffered(32);
+        let mut session_stream = futures::stream::iter(next_session..)
+            .map(move |session_index| {
+                debug!("Starting fetch job for session {session_index}");
+                let api_fetch_single = api_fetch.clone();
+                let decoders_single = decoders.clone();
+                async move {
+                    let signed_session_outcome = retry(
+                        format!("Waiting for session {session_index}"),
+                        background_backoff(),
+                        || async {
+                            api_fetch_single
+                                .await_block(session_index, &decoders_single)
+                                .await
+                        },
+                    )
+                    .await
+                    .expect("Will fail after 136 years");
+                    debug!("Finished fetch job for session {session_index}");
+                    (session_index, signed_session_outcome)
+                }
+            })
+            .buffered(32);
 
         let mut timer = SystemTime::now();
-        let mut sessions_since_last_log = 0_u64;
+        let mut last_session = next_session;
         while let Some((session_index, signed_session_outcome)) = session_stream.next().await {
             let mut connection = self.connection().await?;
             let dbtx = connection.transaction().await?;
@@ -639,77 +622,18 @@ impl FederationObserver {
             )
             .await?;
             dbtx.commit().await?;
-            sessions_since_last_log += 1;
 
             let elapsed = timer.elapsed().unwrap_or_default();
             if elapsed >= Duration::from_secs(5) {
-                let rate = (sessions_since_last_log as f64) / elapsed.as_secs_f64();
-                info!("Synced through session {session_index}, processed {sessions_since_last_log} sessions at a rate of {rate:.2} sessions/s");
+                let sessions_synced = session_index - last_session;
+                let rate = (sessions_synced as f64) / elapsed.as_secs_f64();
+                info!("Synced up to session {session_index}, processed {sessions_synced} sessions at a rate of {rate:.2} sessions/s");
                 timer = SystemTime::now();
-                sessions_since_last_log = 0;
+                last_session = session_index;
             }
         }
 
         unreachable!("Session stream should never end")
-    }
-
-    async fn missing_federation_sessions(
-        &self,
-        federation_id: FederationId,
-    ) -> anyhow::Result<Vec<u64>> {
-        let rows = self
-            .connection()
-            .await?
-            .query(
-                "
-                WITH ordered AS (
-                    SELECT
-                        session_index,
-                        LEAD(session_index) OVER (ORDER BY session_index) AS next_session_index
-                    FROM sessions
-                    WHERE federation_id = $1
-                ),
-                gaps AS (
-                    SELECT
-                        0 AS first_missing_session,
-                        MIN(session_index) - 1 AS last_missing_session
-                    FROM ordered
-                    UNION ALL
-                    SELECT
-                        session_index + 1,
-                        next_session_index - 1
-                    FROM ordered
-                    WHERE next_session_index > session_index + 1
-                )
-                SELECT missing.session_index
-                FROM gaps
-                CROSS JOIN LATERAL generate_series(
-                    gaps.first_missing_session,
-                    gaps.last_missing_session
-                ) AS missing(session_index)
-                WHERE gaps.first_missing_session <= gaps.last_missing_session
-                ORDER BY missing.session_index
-                ",
-                &[&federation_id.consensus_encode_to_vec()],
-            )
-            .await?;
-
-        rows.into_iter()
-            .map(|row| Ok(row.try_get::<_, i32>(0)? as u64))
-            .collect()
-    }
-
-    async fn next_federation_session_index(
-        &self,
-        federation_id: FederationId,
-    ) -> anyhow::Result<u64> {
-        let next_session = query_value::<i64>(
-            &self.connection().await?,
-            "SELECT COALESCE(MAX(session_index) + 1, 0) FROM sessions WHERE federation_id = $1",
-            &[&federation_id.consensus_encode_to_vec()],
-        )
-        .await?;
-        Ok(next_session as u64)
     }
 
     async fn process_session(
@@ -869,7 +793,7 @@ impl FederationObserver {
                 dbtx.execute(
                         "INSERT INTO wallet_peg_ins VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
                         &[
-                            &outpoint.txid.to_byte_array().to_vec(),
+                            &outpoint.txid[..].to_owned(),
                             &(outpoint.vout as i32),
                             &address.to_string(),
                             &maybe_amount_msat.map(|amt| amt as i64).expect("Wallet input must have amount"),
@@ -1265,11 +1189,14 @@ impl FederationObserver {
                 .await?;
             }
             WalletConsensusItem::PegOutSignature(peg_out_sig) => {
-                let peg_out_txid = peg_out_sig.txid;
-                let peg_out_txid_encoded = peg_out_txid.to_byte_array().to_vec();
+                let peg_out_txid = peg_out_sig.txid.to_string();
+                let peg_out_txid_encoded =
+                    fedimint_core::TransactionId::from_str(peg_out_txid.as_str())
+                        .expect("Invalid on chain txid")
+                        .consensus_encode_to_vec();
 
                 dbtx.execute(
-                    "INSERT INTO wallet_withdrawal_transactions (on_chain_txid, federation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    "INSERT INTO wallet_withdrawal_transactions VALUES ($1, $2) ON CONFLICT DO NOTHING",
                     &[
                         &peg_out_txid_encoded,
                         &federation_id.consensus_encode_to_vec(),
@@ -1315,7 +1242,7 @@ impl FederationObserver {
 
                 // at this point, the transaction reached threshold and should broadcast
 
-                let esplora_txid = esplora_client::Txid::from_str(&peg_out_txid.to_string())
+                let esplora_txid = esplora_client::Txid::from_str(peg_out_txid.as_str())
                     .expect("Couldn't create esplora txid");
 
                 let builder = esplora_client::Builder::new(mempool_url);
@@ -1336,13 +1263,67 @@ impl FederationObserver {
                 .await
                 .expect("Reached usize::MAX retries");
 
-                Self::record_wallet_withdrawal_transaction(
-                    dbtx,
-                    federation_id,
-                    peg_out_txid,
-                    &fetched_tx,
-                )
-                .await?;
+                for input in fetched_tx.input {
+                    let prev_out_txid = fedimint_core::TransactionId::from_str(
+                        input.previous_output.txid.to_string().as_str(),
+                    )
+                    .expect("Invalid txid")
+                    .consensus_encode_to_vec();
+
+                    dbtx.execute(
+                        "INSERT INTO wallet_withdrawal_transaction_inputs VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        &[
+                            &prev_out_txid,
+                            &(input.previous_output.vout as i32),
+                            &peg_out_txid_encoded,
+                        ],
+                    )
+                    .await?;
+                }
+
+                for (out_idx, output) in fetched_tx.output.iter().enumerate() {
+                    let address = bitcoin::Address::from_script(
+                        bitcoin::Script::from_bytes(output.script_pubkey.as_bytes()),
+                        bitcoin::Network::Bitcoin,
+                    )
+                    .expect("Invalid bitcoin address");
+
+                    dbtx.execute(
+                        "INSERT INTO wallet_withdrawal_transaction_outputs VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                        &[
+                            &peg_out_txid_encoded,
+                            &(out_idx as i32),
+                            &address.to_string(),
+                            &((output.value.to_sat() as i64) * 1000),
+
+                        ],
+                    )
+                    .await?;
+
+                    // update federation_txid if we found a matching withdrawal address
+                    dbtx.execute(
+                        "
+                        UPDATE wallet_withdrawal_transactions
+                        SET federation_txid = (
+                            SELECT txid
+                            FROM wallet_withdrawal_addresses wwa
+                            WHERE address = $1
+                              AND NOT EXISTS (
+                                SELECT *
+                                FROM wallet_withdrawal_transactions wwt
+                                WHERE wwa.txid = wwt.federation_txid
+                              )
+                            -- if address reuse, assume earliest withdrawal request first
+                            ORDER BY session_index, item_index
+                            LIMIT 1
+                        )
+                        WHERE on_chain_txid = $2
+                          AND federation_txid IS NULL
+                        ",
+                        &[&address.to_string(), &peg_out_txid_encoded],
+                    )
+                    .await?;
+                }
             }
             _ => {
                 // other WalletConsesnsusItems are not needed yet
@@ -1350,106 +1331,6 @@ impl FederationObserver {
         }
 
         Ok(())
-    }
-
-    async fn record_wallet_withdrawal_transaction(
-        dbtx: &Transaction<'_>,
-        federation_id: FederationId,
-        on_chain_txid: Txid,
-        transaction: &bitcoin::Transaction,
-    ) -> Result<bool, tokio_postgres::Error> {
-        let on_chain_txid_encoded = on_chain_txid.to_byte_array().to_vec();
-        dbtx.execute(
-            "INSERT INTO wallet_withdrawal_transactions (on_chain_txid, federation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            &[
-                &on_chain_txid_encoded,
-                &federation_id.consensus_encode_to_vec(),
-            ],
-        )
-        .await?;
-
-        let mut recorded_input = false;
-        for input in &transaction.input {
-            let previous_output_txid = input.previous_output.txid.to_byte_array().to_vec();
-            let previous_output_vout = input.previous_output.vout as i32;
-            recorded_input |= dbtx
-                .execute(
-                    "INSERT INTO wallet_withdrawal_transaction_inputs VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                    &[
-                        &previous_output_txid,
-                        &previous_output_vout,
-                        &on_chain_txid_encoded,
-                    ],
-                )
-                .await?
-                > 0;
-            dbtx.execute(
-                "INSERT INTO wallet_spends VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                &[
-                    &previous_output_txid,
-                    &previous_output_vout,
-                    &on_chain_txid_encoded,
-                ],
-            )
-            .await?;
-        }
-
-        for (out_idx, output) in transaction.output.iter().enumerate() {
-            let Ok(address) = bitcoin::Address::from_script(
-                bitcoin::Script::from_bytes(output.script_pubkey.as_bytes()),
-                bitcoin::Network::Bitcoin,
-            ) else {
-                continue;
-            };
-            let address = address.to_string();
-
-            dbtx.execute(
-                "INSERT INTO wallet_withdrawal_transaction_outputs VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-                &[
-                    &on_chain_txid_encoded,
-                    &(out_idx as i32),
-                    &address,
-                    &((output.value.to_sat() as i64) * 1000),
-                ],
-            )
-            .await?;
-
-            // A peg-out transaction can pay several federation requests. The final output
-            // value can differ from the request due to fees, so match in request order and
-            // record ownership at the exact Bitcoin outpoint.
-            dbtx.execute(
-                "
-                INSERT INTO wallet_withdrawal_recipient_outputs (
-                    on_chain_txid,
-                    on_chain_vout,
-                    federation_id,
-                    federation_txid
-                )
-                SELECT $1, $2, wwa.federation_id, wwa.txid
-                FROM wallet_withdrawal_addresses wwa
-                WHERE wwa.federation_id = $3
-                  AND wwa.address = $4
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM wallet_withdrawal_recipient_outputs mapped
-                    WHERE mapped.federation_id = wwa.federation_id
-                      AND mapped.federation_txid = wwa.txid
-                  )
-                ORDER BY wwa.session_index, wwa.item_index, wwa.out_index
-                LIMIT 1
-                ON CONFLICT DO NOTHING
-                ",
-                &[
-                    &on_chain_txid_encoded,
-                    &(out_idx as i32),
-                    &federation_id.consensus_encode_to_vec(),
-                    &address,
-                ],
-            )
-            .await?;
-        }
-
-        Ok(recorded_input)
     }
 
     async fn refresh_views(self) {
@@ -1477,184 +1358,6 @@ impl FederationObserver {
             .await?;
 
         Ok(())
-    }
-
-    async fn reconcile_wallet_utxos(self) {
-        loop {
-            for federation in self.list_federations().await.unwrap_or_default() {
-                if let Err(error) = self
-                    .reconcile_federation_wallet_utxos(federation.federation_id)
-                    .await
-                {
-                    warn!(fed = %federation.federation_id, "wallet UTXO reconciliation failed: {error:#}");
-                }
-            }
-
-            sleep(Duration::from_secs(15 * 60)).await;
-        }
-    }
-
-    async fn reconcile_federation_wallet_utxos(
-        &self,
-        federation_id: FederationId,
-    ) -> anyhow::Result<()> {
-        self.repair_incomplete_wallet_history(federation_id).await?;
-
-        let observed = self.federation_utxos(federation_id).await?;
-        let guardian_claims = self.guardian_utxo_claims(federation_id).await?;
-        let claimed_outpoints = guardian_claims
-            .iter()
-            .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Ok))
-            .flat_map(|claim| {
-                claim
-                    .utxos
-                    .iter()
-                    .filter(|utxo| {
-                        !matches!(
-                            utxo.state,
-                            GuardianClaimedUtxoState::UnsignedPegOut
-                                | GuardianClaimedUtxoState::UnconfirmedPegOut
-                        )
-                    })
-                    .map(|utxo| utxo.out_point)
-            })
-            .collect::<HashSet<_>>();
-
-        if claimed_outpoints.is_empty() {
-            return Ok(());
-        }
-
-        let client = esplora_client::Builder::new(&self.mempool_url).build_async()?;
-        let candidates = observed
-            .into_iter()
-            .filter_map(|utxo| {
-                (!claimed_outpoints.contains(&utxo.out_point)
-                    && !claimed_outpoints.contains(&outpoint_with_reversed_txid(utxo.out_point)))
-                .then_some(utxo.out_point)
-            })
-            .collect::<Vec<_>>();
-        let mut repairs = futures::stream::iter(
-            candidates
-                .into_iter()
-                .map(|outpoint| self.reconcile_spent_outpoint(outpoint, &client)),
-        )
-        .buffer_unordered(8);
-        let mut repaired = 0;
-        while let Some(result) = repairs.next().await {
-            match result {
-                Ok(true) => repaired += 1,
-                Ok(false) => {}
-                Err(error) => {
-                    warn!(fed = %federation_id, "failed to reconcile wallet UTXO: {error:#}")
-                }
-            }
-        }
-
-        if repaired > 0 {
-            tracing::info!(fed = %federation_id, repaired, "reconciled spent wallet UTXOs");
-        }
-
-        Ok(())
-    }
-
-    async fn repair_incomplete_wallet_history(
-        &self,
-        federation_id: FederationId,
-    ) -> anyhow::Result<()> {
-        let rows = self
-            .connection()
-            .await?
-            .query(
-                "
-            SELECT wwt.on_chain_txid
-            FROM wallet_withdrawal_transactions wwt
-            WHERE wwt.federation_id = $1
-              AND EXISTS (
-                SELECT 1
-                FROM wallet_withdrawal_signatures signature
-                WHERE signature.on_chain_txid = wwt.on_chain_txid
-              )
-              AND (
-                NOT EXISTS (
-                  SELECT 1 FROM wallet_withdrawal_transaction_inputs wwti
-                  WHERE wwti.on_chain_txid = wwt.on_chain_txid
-                )
-                OR NOT EXISTS (
-                  SELECT 1 FROM wallet_withdrawal_transaction_outputs wwto
-                  WHERE wwto.on_chain_txid = wwt.on_chain_txid
-                )
-              )
-            ORDER BY wwt.on_chain_txid
-            LIMIT 32
-            ",
-                &[&federation_id.consensus_encode_to_vec()],
-            )
-            .await?;
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let client = esplora_client::Builder::new(&self.mempool_url).build_async()?;
-        for row in rows {
-            let txid = Txid::from_slice(&row.get::<_, Vec<u8>>(0))?;
-            let esplora_txid = esplora_client::Txid::from_str(&txid.to_string())?;
-            let transaction = client.get_tx_no_opt(&esplora_txid).await?;
-            let mut connection = self.connection().await?;
-            let dbtx = connection.transaction().await?;
-            Self::record_wallet_withdrawal_transaction(&dbtx, federation_id, txid, &transaction)
-                .await?;
-            dbtx.commit().await?;
-        }
-
-        Ok(())
-    }
-
-    async fn reconcile_spent_outpoint(
-        &self,
-        stored_outpoint: OutPoint,
-        client: &esplora_client::AsyncClient,
-    ) -> anyhow::Result<bool> {
-        let candidate_txids = [
-            stored_outpoint.txid,
-            outpoint_with_reversed_txid(stored_outpoint).txid,
-        ];
-
-        for txid in candidate_txids {
-            let Some(status) = client
-                .get_output_status(&txid, stored_outpoint.vout as u64)
-                .await?
-            else {
-                continue;
-            };
-            let Some(spending_txid) = status.txid else {
-                continue;
-            };
-            if !status.spent || !status.status.is_some_and(|status| status.confirmed) {
-                continue;
-            }
-
-            let mut connection = self.connection().await?;
-            let dbtx = connection.transaction().await?;
-            // A spent observer candidate does not prove its spending transaction belongs to
-            // the federation. Record only the spend evidence; following its outputs would
-            // import an unrelated Bitcoin transaction into the wallet graph.
-            let inserted = dbtx
-                .execute(
-                    "INSERT INTO wallet_spends VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                    &[
-                        &stored_outpoint.txid.to_byte_array().to_vec(),
-                        &(stored_outpoint.vout as i32),
-                        &spending_txid.to_byte_array().to_vec(),
-                    ],
-                )
-                .await?
-                > 0;
-            dbtx.commit().await?;
-            return Ok(inserted);
-        }
-
-        Ok(false)
     }
 
     pub async fn get_federation_assets(
@@ -1706,52 +1409,15 @@ impl FederationObserver {
             "SELECT on_chain_txid, on_chain_vout, address, amount_msat FROM utxos WHERE federation_id = $1 ORDER BY amount_msat DESC",
             &[&federation_id.consensus_encode_to_vec()],
         ).await?.into_iter().map(|utxo| {
-            Ok(FederationUtxo {
+            Result::<_, anyhow::Error>::Ok(FederationUtxo {
                 address: Address::from_str(&utxo.address)?,
-                out_point: Self::outpoint_from_database(
-                    &utxo.on_chain_txid,
-                    utxo.on_chain_vout,
-                )?,
+                out_point: OutPoint {
+                    txid: Txid::from_slice(&utxo.on_chain_txid)?,
+                    vout: utxo.on_chain_vout.try_into()?,
+                },
                 amount: Amount::from_msats(utxo.amount_msat.try_into()?),
             })
         }).collect()
-    }
-
-    pub async fn federation_peg_out_recipient_outpoints(
-        &self,
-        federation_id: FederationId,
-    ) -> anyhow::Result<HashSet<OutPoint>> {
-        #[derive(Debug, FromRow)]
-        struct OutPointRaw {
-            on_chain_txid: Vec<u8>,
-            on_chain_vout: i32,
-        }
-
-        query::<OutPointRaw>(
-            &self.connection().await?,
-            "
-            SELECT on_chain_txid, on_chain_vout
-            FROM wallet_withdrawal_recipient_outputs
-            WHERE federation_id = $1
-            ",
-            &[&federation_id.consensus_encode_to_vec()],
-        )
-        .await?
-        .into_iter()
-        .map(|outpoint| {
-            Self::outpoint_from_database(&outpoint.on_chain_txid, outpoint.on_chain_vout)
-        })
-        .collect()
-    }
-
-    fn outpoint_from_database(
-        on_chain_txid: &[u8],
-        on_chain_vout: i32,
-    ) -> anyhow::Result<OutPoint> {
-        Ok(OutPoint {
-            txid: Txid::from_slice(on_chain_txid)?,
-            vout: on_chain_vout.try_into()?,
-        })
     }
 
     pub async fn guardian_utxo_claims(
@@ -1792,8 +1458,8 @@ impl FederationObserver {
                 .collect(),
             None,
         )?;
-
         let module_api = api.with_module(wallet_module_id);
+
         Ok(join_all(config.global.api_endpoints.keys().map(|peer_id| {
             let module_api = module_api.clone();
             let peer_id = *peer_id;
@@ -1872,7 +1538,6 @@ impl FederationObserver {
                 return outpoints_by_txid
                     .into_values()
                     .flatten()
-                    .into_iter()
                     .map(|outpoint| {
                         (
                             outpoint,
@@ -1883,78 +1548,81 @@ impl FederationObserver {
             }
         };
 
-        join_all(outpoints_by_txid.into_iter().map(|(txid, outpoints)| {
-            let client = client.clone();
-            async move {
-                let tx = match client.get_tx_no_opt(&txid).await {
-                    Ok(tx) => tx,
-                    Err(error) => {
-                        return outpoints
-                            .into_iter()
-                            .map(|outpoint| {
-                                (
-                                    outpoint,
-                                    Err(format!("failed to fetch transaction: {error}")),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                    }
-                };
+        futures::stream::iter(outpoints_by_txid)
+            .map(|(txid, outpoints)| {
+                let client = client.clone();
+                async move {
+                    let tx = match client.get_tx_no_opt(&txid).await {
+                        Ok(tx) => tx,
+                        Err(error) => {
+                            return outpoints
+                                .into_iter()
+                                .map(|outpoint| {
+                                    (
+                                        outpoint,
+                                        Err(format!("failed to fetch transaction: {error}")),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                        }
+                    };
 
-                let status = match client.get_tx_status(&txid).await {
-                    Ok(status) => status,
-                    Err(error) => {
-                        return outpoints
-                            .into_iter()
-                            .map(|outpoint| {
-                                (
-                                    outpoint,
-                                    Err(format!("failed to fetch transaction status: {error}")),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                    }
-                };
+                    let status = match client.get_tx_status(&txid).await {
+                        Ok(status) => status,
+                        Err(error) => {
+                            return outpoints
+                                .into_iter()
+                                .map(|outpoint| {
+                                    (
+                                        outpoint,
+                                        Err(format!("failed to fetch transaction status: {error}")),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                        }
+                    };
 
-                outpoints
-                    .into_iter()
-                    .map(|outpoint| {
-                        let result = tx
-                            .output
-                            .get(outpoint.vout as usize)
-                            .ok_or_else(|| {
-                                format!("transaction does not have vout {}", outpoint.vout)
-                            })
-                            .map(|output| {
-                                let address = Address::from_script(
-                                    &output.script_pubkey,
-                                    bitcoin::Network::Bitcoin,
-                                )
-                                .ok()
-                                .map(|address| address.to_string());
+                    outpoints
+                        .into_iter()
+                        .map(|outpoint| {
+                            let result = tx
+                                .output
+                                .get(outpoint.vout as usize)
+                                .ok_or_else(|| {
+                                    format!("transaction does not have vout {}", outpoint.vout)
+                                })
+                                .map(|output| {
+                                    let address = Address::from_script(
+                                        &output.script_pubkey,
+                                        bitcoin::Network::Bitcoin,
+                                    )
+                                    .ok()
+                                    .map(|address| address.to_string());
 
-                                GuardianClaimedUtxoOnchain {
-                                    script_pubkey: output
-                                        .script_pubkey
-                                        .as_bytes()
-                                        .as_hex()
-                                        .to_string(),
-                                    address,
-                                    amount: Amount::from_sats(output.value.to_sat()),
-                                    confirmed: status.confirmed,
-                                    block_height: status.block_height,
-                                }
-                            });
+                                    GuardianClaimedUtxoOnchain {
+                                        script_pubkey: output
+                                            .script_pubkey
+                                            .as_bytes()
+                                            .as_hex()
+                                            .to_string(),
+                                        address,
+                                        amount: Amount::from_sats(output.value.to_sat()),
+                                        confirmed: status.confirmed,
+                                        block_height: status.block_height,
+                                    }
+                                });
 
-                        (outpoint, result)
-                    })
-                    .collect::<Vec<_>>()
-            }
-        }))
-        .await
-        .into_iter()
-        .flatten()
-        .collect()
+                            (outpoint, result)
+                        })
+                        .collect::<Vec<_>>()
+                }
+            })
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     pub async fn totals(&self) -> anyhow::Result<FedimintTotals> {
@@ -2149,11 +1817,16 @@ impl FederationObserver {
             .await?;
         }
 
-        dbtx.commit().await?;
         info!("Backfill complete!");
 
         Ok(())
     }
+}
+
+fn last_n_day_iter(now: NaiveDate, days: u32) -> impl Iterator<Item = NaiveDate> {
+    (0..days)
+        .rev()
+        .map(move |day| now - chrono::Duration::days(day as i64))
 }
 
 fn wallet_summary_claimed_utxos(summary: WalletSummary) -> Vec<GuardianClaimedUtxo> {
@@ -2200,25 +1873,9 @@ fn append_claimed_utxos(
     }));
 }
 
-fn outpoint_with_reversed_txid(outpoint: OutPoint) -> OutPoint {
-    let mut txid_bytes = outpoint.txid.to_byte_array();
-    txid_bytes.reverse();
-    OutPoint {
-        txid: Txid::from_byte_array(txid_bytes),
-        vout: outpoint.vout,
-    }
-}
-
-fn last_n_day_iter(now: NaiveDate, days: u32) -> impl Iterator<Item = NaiveDate> {
-    (0..days)
-        .rev()
-        .map(move |day| now - chrono::Duration::days(day as i64))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{last_n_day_iter, outpoint_with_reversed_txid};
-    use bitcoin::OutPoint;
+    use crate::federation::observer::last_n_day_iter;
 
     #[test]
     fn test_day_iter() {
@@ -2228,23 +1885,5 @@ mod tests {
         assert_eq!(last_7_days.len(), days as usize);
         assert_eq!(last_7_days[6], now);
         assert_eq!(last_7_days[0], now - chrono::Duration::days(6));
-    }
-
-    #[test]
-    fn reverses_legacy_outpoint_txids() {
-        let canonical = OutPoint {
-            txid: "d88e55afef8cdc5bd306bf4e5a5d1a202fd89ee50592a5b6c56c8ba5da71e305"
-                .parse()
-                .unwrap(),
-            vout: 1,
-        };
-
-        let legacy = outpoint_with_reversed_txid(canonical);
-
-        assert_eq!(
-            legacy.to_string(),
-            "05e371daa58b6cc5b6a59205e59ed82f201a5d5a4ebf06d35bdc8cefaf558ed8:1"
-        );
-        assert_eq!(outpoint_with_reversed_txid(legacy), canonical);
     }
 }

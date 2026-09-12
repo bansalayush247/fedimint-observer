@@ -188,3 +188,12 @@ pub struct GatewayUptimeMetrics {
     pub offline_minutes: u64,
     pub uptime_pct: f64,
 }
+
+/// Federation-wide gateway availability aggregated into daily buckets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayUptimeTrendPoint {
+    pub day: DateTime<Utc>,
+    pub seen_samples: u64,
+    pub total_samples: u64,
+    pub uptime_pct: f64,
+}

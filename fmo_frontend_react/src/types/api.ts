@@ -101,26 +101,13 @@ export interface GatewayUptimeMetrics {
   uptime_pct: number;
 }
 
+export interface GatewayUptimeTrendPoint {
+  day: string;
+  seen_samples: number;
+  total_samples: number;
+  uptime_pct: number;
+}
+
 export type GatewayWindow = '1h' | '24h' | '7d' | '30d' | '90d';
 
-export interface GuardianHealth {
-  avg_uptime: number;
-  avg_latency: number;
-  software_version: string | null;
-  latest: GuardianHealthLatest | null;
-}
-
-export interface GuardianHealthLatest {
-  block_height: number;
-  block_outdated: boolean;
-  session_count: number;
-  session_outdated: boolean;
-}
-
 export type FederationHealth = 'online' | 'degraded' | 'offline';
-
-export interface NavItem {
-  name: string;
-  href: string;
-  active: boolean;
-}
