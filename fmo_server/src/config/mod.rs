@@ -62,9 +62,11 @@ pub async fn fetch_federation_config(
 pub async fn fetch_federation_gateways(
     Path(invite): Path<InviteCode>,
 ) -> Result<Json<Vec<GatewayInfo>>> {
-    let config = fedimint_api_client::api::net::Connector::default()
-        .download_from_invite_code(&invite)
+    let connectors = fedimint_connectors::ConnectorRegistry::build_from_client_env()?
+        .bind()
         .await?;
+    let (config, _api) =
+        fedimint_api_client::download_from_invite_code(&connectors, &invite).await?;
     let gateways = fetch_gateways_for_config(&config).await?;
     Ok(gateways.into())
 }
@@ -99,8 +101,10 @@ impl FederationConfigCache {
 }
 
 async fn fetch_config_inner(invite: &InviteCode) -> anyhow::Result<JsonClientConfig> {
-    let raw_config = fedimint_api_client::api::net::Connector::default()
-        .download_from_invite_code(invite)
+    let connectors = fedimint_connectors::ConnectorRegistry::build_from_client_env()?
+        .bind()
         .await?;
+    let (raw_config, _api) =
+        fedimint_api_client::download_from_invite_code(&connectors, invite).await?;
     config_to_json(raw_config)
 }

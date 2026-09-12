@@ -27,15 +27,13 @@ impl FederationObserver {
         const REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 
         let mut interval = tokio::time::interval(REQUEST_INTERVAL);
-        let api = DynGlobalApi::from_endpoints(
-            config
-                .global
-                .api_endpoints
-                .iter()
-                .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone())),
-            &None,
-        )
-        .await?;
+        let peers = config
+            .global
+            .api_endpoints
+            .iter()
+            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
+            .collect();
+        let api = DynGlobalApi::new(self.connectors().clone(), peers, None)?;
 
         let wallet_module = config
             .modules
@@ -141,22 +139,46 @@ impl FederationObserver {
 
         let health_rows = query::<GuardianHealthRow>(
             &self.connection().await?,
+            // The `guardians` CTE emulates an index skip-scan over the
+            // (federation_id, guardian_id, time) index to enumerate the
+            // federation's guardian ids. Naively grouping by guardian_id to get
+            // the latest row per guardian instead degenerates into a full scan
+            // of the (large) guardian_health table, since PostgreSQL has no
+            // native skip-scan. With the guardian ids known we can fetch each
+            // latest row with a single index descent.
             // language=postgresql
-            "SELECT
-                latest.guardian_id,
+            "WITH RECURSIVE guardians AS (
+                 SELECT (SELECT h.guardian_id
+                         FROM guardian_health h
+                         WHERE h.federation_id = $1
+                         ORDER BY h.guardian_id
+                         LIMIT 1) AS guardian_id
+               UNION ALL
+                 SELECT (SELECT h.guardian_id
+                         FROM guardian_health h
+                         WHERE h.federation_id = $1
+                           AND h.guardian_id > g.guardian_id
+                         ORDER BY h.guardian_id
+                         LIMIT 1)
+                 FROM guardians g
+                 WHERE g.guardian_id IS NOT NULL
+             )
+             SELECT
+                g.guardian_id,
                 latest.block_height,
                 (latest.status -> 'federation' ->> 'session_count')::integer AS session_count,
                 latest.software_version,
                 last30d.uptime,
                 last30d.latency_ms
-             FROM guardian_health latest
-             INNER JOIN (
-                 SELECT guardian_id, MAX(time) as latest_time
-                 FROM guardian_health
-                 WHERE federation_id = $1
-                 GROUP BY guardian_id
-             ) max_times ON latest.guardian_id = max_times.guardian_id
-                           AND latest.time = max_times.latest_time
+             FROM guardians g
+             CROSS JOIN LATERAL (
+                 SELECT h.block_height, h.status, h.software_version
+                 FROM guardian_health h
+                 WHERE h.federation_id = $1
+                   AND h.guardian_id = g.guardian_id
+                 ORDER BY h.time DESC
+                 LIMIT 1
+             ) latest
              INNER JOIN (
                  SELECT
                      guardian_id,
@@ -166,8 +188,8 @@ impl FederationObserver {
                  WHERE federation_id = $1
                    AND time > NOW() - INTERVAL '30 days'
                  GROUP BY guardian_id
-             ) last30d ON latest.guardian_id = last30d.guardian_id
-             WHERE latest.federation_id = $1",
+             ) last30d ON g.guardian_id = last30d.guardian_id
+             WHERE g.guardian_id IS NOT NULL",
             &[&federation_id.consensus_encode_to_vec()],
         )
         .await?;
@@ -182,9 +204,11 @@ impl FederationObserver {
         Ok(health_rows
             .into_iter()
             .map(|row| {
-                let latest = if row.session_count.is_some() && row.block_height.is_some() {
-                    let block_height = row.block_height.expect("checked above") as u32;
-                    let session_count = row.session_count.expect("checked above") as u32;
+                let latest = if let (Some(session_count), Some(block_height)) =
+                    (row.session_count, row.block_height)
+                {
+                    let block_height = block_height as u32;
+                    let session_count = session_count as u32;
                     Some(GuardianHealthLatest {
                         block_height,
                         block_outdated: our_block_height.saturating_sub(block_height) > 6,
@@ -219,21 +243,45 @@ impl FederationObserver {
 
         let federations = query::<FederationHealthRow>(
             &self.connection().await?,
+            // See `get_guardian_health` for why the guardian ids are enumerated
+            // with a recursive CTE instead of grouping over guardian_health:
+            // it emulates the index skip-scan PostgreSQL lacks, turning a full
+            // table scan into a handful of index descents.
             // language=postgresql
-            "SELECT
-                gh.federation_id,
-                COUNT(DISTINCT gh.guardian_id)::int as guardians,
-                COUNT(DISTINCT CASE WHEN gh.status -> 'federation' ->> 'session_count' IS NOT NULL
-                                   THEN gh.guardian_id END)::int as online_guardians
-             FROM guardian_health gh
-             INNER JOIN (
-                 SELECT federation_id, guardian_id, MAX(time) as latest_time
-                 FROM guardian_health
-                 GROUP BY federation_id, guardian_id
-             ) latest ON gh.federation_id = latest.federation_id
-                        AND gh.guardian_id = latest.guardian_id
-                        AND gh.time = latest.latest_time
-             GROUP BY gh.federation_id",
+            "WITH RECURSIVE guardians AS (
+                 SELECT f.federation_id,
+                        (SELECT h.guardian_id
+                         FROM guardian_health h
+                         WHERE h.federation_id = f.federation_id
+                         ORDER BY h.guardian_id
+                         LIMIT 1) AS guardian_id
+                 FROM federations f
+               UNION ALL
+                 SELECT g.federation_id,
+                        (SELECT h.guardian_id
+                         FROM guardian_health h
+                         WHERE h.federation_id = g.federation_id
+                           AND h.guardian_id > g.guardian_id
+                         ORDER BY h.guardian_id
+                         LIMIT 1)
+                 FROM guardians g
+                 WHERE g.guardian_id IS NOT NULL
+             )
+             SELECT
+                g.federation_id,
+                COUNT(*)::int as guardians,
+                COUNT(*) FILTER (WHERE latest.status -> 'federation' ->> 'session_count' IS NOT NULL)::int as online_guardians
+             FROM guardians g
+             CROSS JOIN LATERAL (
+                 SELECT h.status
+                 FROM guardian_health h
+                 WHERE h.federation_id = g.federation_id
+                   AND h.guardian_id = g.guardian_id
+                 ORDER BY h.time DESC
+                 LIMIT 1
+             ) latest
+             WHERE g.guardian_id IS NOT NULL
+             GROUP BY g.federation_id",
             &[],
         )
         .await?;
@@ -248,9 +296,15 @@ impl FederationObserver {
                         .map_err(|_| anyhow!("Invalid federation id in DB"))?,
                 ));
 
-                // Special case single guardian federations to not show them as degraded
                 if federation.guardians == 1 {
-                    return Ok((federation_id, FederationHealth::Online));
+                    return Ok((
+                        federation_id,
+                        if federation.online_guardians == 1 {
+                            FederationHealth::Online
+                        } else {
+                            FederationHealth::Offline
+                        },
+                    ));
                 }
 
                 let threshold = NumPeers::from(federation.guardians as usize).threshold();

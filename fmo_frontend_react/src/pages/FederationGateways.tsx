@@ -1,18 +1,34 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api } from '../services/api';
-import type { FederationSummary, GatewayInfo, GatewayWindow } from '../types/api';
+import type {
+  FederationSummary,
+  GatewayInfo,
+  GatewayUptimeTrendPoint,
+  GatewayWindow,
+} from '../types/api';
 import { GatewayWarningPage, type GatewayWarningState } from '../components/GatewayWarningPage';
 
 type GatewayStatus = 'online' | 'degraded' | 'offline' | 'unknown';
 type UptimeStripStatus = 'online' | 'degraded' | 'offline' | 'unknown';
+type GatewayFilter = 'all' | GatewayStatus;
+type GatewaySort = 'freshness' | 'status' | 'uptime' | 'activity';
+type SortDirection = 'asc' | 'desc';
+
+const UptimeTrendChart = lazy(() => import('echarts-for-react'));
+const INITIAL_RENDER_COUNT = 50;
+const STATUS_RANK: Record<GatewayStatus, number> = {
+  offline: 0,
+  degraded: 1,
+  unknown: 2,
+  online: 3,
+};
 
 interface GatewayWithStatus extends GatewayInfo {
   firstSeenDate: Date | null;
   lastSeenDate: Date | null;
   status: GatewayStatus;
   minutesSinceLastSeen: number | null;
-  inferredOfflineMinutes: number;
   estimatedOfflineMinutes: number;
   estimatedOnlineMinutes: number;
   estimatedUnknownMinutes: number;
@@ -23,6 +39,7 @@ interface GatewayWithStatus extends GatewayInfo {
   settleCountWindow: number;
   cancelCountWindow: number;
   totalVolumeMsatWindow: number;
+  searchText: string;
 }
 
 function parseTimestamp(value?: string): Date | null {
@@ -66,16 +83,6 @@ function formatRelative(date: Date | null): string {
 function shortId(value: string): string {
   if (value.length <= 16) return value;
   return `${value.slice(0, 8)}...${value.slice(-8)}`;
-}
-
-function formatDuration(minutes: number): string {
-  const safe = Math.max(0, Math.floor(minutes));
-  const days = Math.floor(safe / (60 * 24));
-  const hours = Math.floor((safe % (60 * 24)) / 60);
-  const mins = safe % 60;
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${mins}m`;
-  return `${mins}m`;
 }
 
 function formatCompactDuration(minutes: number): string {
@@ -184,6 +191,29 @@ function getUptimeBucketLabel(
   return `${start}–${end} ago`;
 }
 
+function getUptimeBucketTooltip(
+  status: UptimeStripStatus,
+  bucketIndex: number,
+  totalBuckets: number,
+  windowMinutes: number,
+): string {
+  return `Bucket ${bucketIndex + 1} of ${totalBuckets} · ${getUptimeBucketLabel(
+    bucketIndex,
+    totalBuckets,
+    windowMinutes,
+  )} · Estimated ${status}`;
+}
+
+function formatEndpointLabel(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    if (url.protocol === 'iroh:') return `iroh://${shortId(url.host)}`;
+    return `${url.host}${url.pathname === '/' ? '' : url.pathname}`;
+  } catch {
+    return shortId(endpoint);
+  }
+}
+
 function mergeGatewayData(observedGateways: GatewayInfo[], liveGateways: GatewayInfo[]): GatewayInfo[] {
   if (observedGateways.length === 0) return liveGateways;
   if (liveGateways.length === 0) return observedGateways;
@@ -223,6 +253,11 @@ function mergeGatewayData(observedGateways: GatewayInfo[], liveGateways: Gateway
 interface GatewaySelection {
   gateways: GatewayInfo[];
   warning: GatewayWarningState | null;
+}
+
+interface RawAnnouncementDialog {
+  gatewayName: string;
+  raw: Record<string, unknown>;
 }
 
 function selectGatewayData(
@@ -329,6 +364,14 @@ export function FederationGateways() {
   const [error, setError] = useState<string | null>(null);
   const [gatewayWarning, setGatewayWarning] = useState<GatewayWarningState | null>(null);
   const [timeWindow, setTimeWindow] = useState<GatewayWindow>('7d');
+  const [uptimeTrend, setUptimeTrend] = useState<GatewayUptimeTrendPoint[]>([]);
+  const [uptimeTrendLoading, setUptimeTrendLoading] = useState(true);
+  const [gatewayFilter, setGatewayFilter] = useState<GatewayFilter>('all');
+  const [gatewaySort, setGatewaySort] = useState<GatewaySort>('freshness');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
+  const [gatewaySearch, setGatewaySearch] = useState('');
+  const [visibleGatewayCount, setVisibleGatewayCount] = useState(INITIAL_RENDER_COUNT);
+  const [rawAnnouncement, setRawAnnouncement] = useState<RawAnnouncementDialog | null>(null);
   const hasLoadedOnce = useRef(false);
   const requestSeq = useRef(0);
   const federationCache = useRef<Map<string, FederationSummary | null>>(new Map());
@@ -346,9 +389,21 @@ export function FederationGateways() {
     }
     setError(null);
     setGatewayWarning(null);
+    setUptimeTrend([]);
+    setUptimeTrendLoading(true);
 
     (async () => {
       try {
+        void api.getFederationGatewayUptimeTrend(id, timeWindow)
+          .then((trend) => {
+            if (!cancelled && currentRequest === requestSeq.current) setUptimeTrend(trend);
+          })
+          .catch(() => {
+            if (!cancelled && currentRequest === requestSeq.current) setUptimeTrend([]);
+          })
+          .finally(() => {
+            if (!cancelled && currentRequest === requestSeq.current) setUptimeTrendLoading(false);
+          });
         let fed: FederationSummary | null | undefined = federationCache.current.get(id);
         if (fed === undefined) {
           const federations = await api.getFederations();
@@ -497,6 +552,12 @@ export function FederationGateways() {
               ),
             )
           : null;
+        const searchText = [
+          gateway.lightning_alias,
+          gateway.gateway_id,
+          gateway.node_pub_key,
+          gateway.api_endpoint,
+        ].join(' ').toLowerCase();
 
         return {
           ...gateway,
@@ -504,7 +565,6 @@ export function FederationGateways() {
           lastSeenDate,
           status,
           minutesSinceLastSeen,
-          inferredOfflineMinutes: inferredOfflineFromRecency,
           estimatedOfflineMinutes,
           estimatedOnlineMinutes,
           estimatedUnknownMinutes,
@@ -515,12 +575,8 @@ export function FederationGateways() {
           settleCountWindow,
           cancelCountWindow,
           totalVolumeMsatWindow,
+          searchText,
         };
-      })
-      .sort((a, b) => {
-        const left = a.lastSeenDate?.getTime() ?? 0;
-        const right = b.lastSeenDate?.getTime() ?? 0;
-        return right - left;
       });
   }, [gateways, windowMinutes]);
 
@@ -529,9 +585,10 @@ export function FederationGateways() {
     const online = rows.filter((row) => row.status === 'online').length;
     const degraded = rows.filter((row) => row.status === 'degraded').length;
     const offline = rows.filter((row) => row.status === 'offline').length;
+    const unknown = total - online - degraded - offline;
     const vetted = rows.filter((row) => row.vetted).length;
 
-    return { total, online, degraded, offline, vetted };
+    return { total, online, degraded, offline, unknown, vetted };
   }, [rows]);
 
   const avgUptime = useMemo(() => {
@@ -547,31 +604,72 @@ export function FederationGateways() {
     return total / rows.length;
   }, [rows]);
 
-  const uptimeStrips = useMemo(() => {
-    return [...rows]
-      .sort((a, b) => {
-        if (b.estimatedUptimePct !== a.estimatedUptimePct) {
-          return b.estimatedUptimePct - a.estimatedUptimePct;
-        }
-        return (b.realActivityScore ?? 0) - (a.realActivityScore ?? 0);
-      })
-      .map((gateway) => ({
-        gateway,
-        strip: buildUptimeStrip(gateway, windowMinutes),
-      }));
-  }, [rows, windowMinutes]);
+  const filteredRows = useMemo(() => {
+    const query = gatewaySearch.trim().toLowerCase();
+    const filtered = rows.filter((row) => (
+      (gatewayFilter === 'all' || row.status === gatewayFilter)
+      && (!query || row.searchText.includes(query))
+    ));
 
-  const mostActive = useMemo(() => {
-    return rows
-      .filter((row) => row.realActivityScore !== null)
-      .sort((a, b) => (b.realActivityScore ?? 0) - (a.realActivityScore ?? 0))
-      .slice(0, 5);
-  }, [rows]);
+    return filtered.sort((left, right) => {
+      let comparison: number;
+      switch (gatewaySort) {
+        case 'status':
+          comparison = STATUS_RANK[left.status] - STATUS_RANK[right.status]
+            || (left.minutesSinceLastSeen ?? 0) - (right.minutesSinceLastSeen ?? 0);
+          break;
+        case 'uptime':
+          comparison = left.estimatedUptimePct - right.estimatedUptimePct;
+          break;
+        case 'activity':
+          comparison = (left.realActivityScore ?? -1) - (right.realActivityScore ?? -1);
+          break;
+        case 'freshness':
+        default:
+          comparison = (left.lastSeenDate?.getTime() ?? 0) - (right.lastSeenDate?.getTime() ?? 0);
+      }
+      return sortDirection === 'asc' ? comparison : -comparison;
+    });
+  }, [gatewayFilter, gatewaySearch, gatewaySort, rows, sortDirection]);
 
-  const hasRealActivityData = useMemo(
-    () => rows.some((row) => row.realActivityScore !== null),
-    [rows],
+  useEffect(() => {
+    setVisibleGatewayCount(INITIAL_RENDER_COUNT);
+  }, [gatewayFilter, gatewaySearch, gatewaySort, id, sortDirection]);
+
+  useEffect(() => {
+    if (!rawAnnouncement) return undefined;
+
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setRawAnnouncement(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [rawAnnouncement]);
+
+  const uptimeStripByGatewayId = useMemo(
+    () => new Map(rows.map((gateway) => [
+      gateway.gateway_id,
+      buildUptimeStrip(gateway, windowMinutes),
+    ])),
+    [rows, windowMinutes],
   );
+  const visibleRows = useMemo(
+    () => filteredRows.slice(0, visibleGatewayCount),
+    [filteredRows, visibleGatewayCount],
+  );
+
+  const uptimeTrendOption = useMemo(() => ({
+    animationDuration: 200,
+    grid: { top: 18, right: 18, bottom: 30, left: 42 },
+    tooltip: { trigger: 'axis', valueFormatter: (value: number | string) => `${Number(value).toFixed(1)}%` },
+    xAxis: {
+      type: 'category', boundaryGap: false,
+      data: uptimeTrend.map((point) => new Date(point.day).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })),
+      axisLabel: { color: '#6b7280', fontSize: 11 }, axisLine: { lineStyle: { color: '#d1d5db' } },
+    },
+    yAxis: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%', color: '#6b7280', fontSize: 11 }, splitLine: { lineStyle: { color: '#e5e7eb' } } },
+    series: [{ name: 'Gateway availability', type: 'line', smooth: true, symbol: uptimeTrend.length > 45 ? 'none' : 'circle', symbolSize: 5, data: uptimeTrend.map((point) => Number(point.uptime_pct.toFixed(2))), lineStyle: { color: '#2563eb', width: 2.5 }, itemStyle: { color: '#2563eb' }, areaStyle: { color: 'rgba(37, 99, 235, 0.12)' } }],
+  }), [uptimeTrend]);
 
   if (loading) {
     return (
@@ -594,209 +692,60 @@ export function FederationGateways() {
     .toUpperCase();
 
   return (
-    <div className="py-4 sm:py-8 px-4 sm:px-0">
-      <div className="mb-4 sm:mb-6">
-        <Link
-          to={`/federations/${id}`}
-          className="text-sm sm:text-base text-blue-600 dark:text-blue-400 hover:underline"
-        >
-          ← Back to Federation Details
-        </Link>
-      </div>
+    <div className="py-5 sm:py-8">
+      <Link to={`/federations/${id}`} className="text-sm text-blue-700 hover:underline dark:text-blue-300">← Federation details</Link>
+      <header className="mt-4 mb-4 rounded-2xl border border-slate-200 bg-gradient-to-br from-white to-blue-50 p-5 shadow-sm dark:border-gray-700 dark:from-gray-800 dark:to-blue-950/30 sm:p-6">
+        <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-end"><div><div className="text-xs font-semibold uppercase tracking-[0.16em] text-blue-700 dark:text-blue-300">Lightning gateway observatory</div><h1 className="mt-2 break-words text-3xl font-bold tracking-tight text-gray-950 dark:text-white">{federationName}</h1></div><div className="rounded-xl bg-slate-100 p-1 dark:bg-gray-900"><div className="flex gap-1">{(['24h', '7d', '30d', '90d'] as GatewayWindow[]).map((window) => <button key={window} disabled={windowLoading} onClick={() => setTimeWindow(window)} className={`rounded-lg px-3 py-2 text-sm font-semibold ${timeWindow === window ? 'bg-white text-blue-700 shadow-sm dark:bg-gray-700 dark:text-blue-300' : 'text-gray-600 dark:text-gray-400'} ${windowLoading ? 'cursor-wait opacity-70' : ''}`}>{window.toUpperCase()}</button>)}</div><div className="px-2 pt-1 text-right text-[11px] text-gray-500">{windowLoading ? 'Refreshing…' : `Observed over ${timeWindow.toUpperCase()}`}</div></div></div>
+        <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-sm dark:border-gray-700"><span className="font-semibold text-gray-950 dark:text-white">{totals.total} gateways</span><span className="text-green-700 dark:text-green-300">● {totals.online} online</span><span className="text-yellow-700 dark:text-yellow-300">● {totals.degraded} degraded</span><span className="text-red-700 dark:text-red-300">● {totals.offline} offline</span><span className="text-gray-600 dark:text-gray-300">{totals.vetted} vetted</span><span className="sm:ml-auto font-semibold text-indigo-700 dark:text-indigo-300">{avgUptime.toFixed(1)}% uptime <span className="font-normal text-xs text-gray-500">({avgCoverage.toFixed(0)}% observed)</span></span></div>
+      </header>
 
-      <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 dark:text-white mb-2 break-words">
-        {federationName} Gateways
-      </h1>
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-6 sm:mb-8">
-        <p className="text-sm sm:text-base text-gray-600 dark:text-gray-400">
-        Gateway registry view with latest-seen freshness and federation LN gateway metadata.
-        </p>
-        <div className="flex items-center gap-2">
-          {windowLoading && (
-            <span className="text-xs text-gray-500 dark:text-gray-400">Updating...</span>
-          )}
-          {(['24h', '7d', '30d', '90d'] as GatewayWindow[]).map((window) => (
-            <button
-              key={window}
-              disabled={windowLoading}
-              onClick={() => setTimeWindow(window)}
-              className={`px-3 py-1.5 text-sm rounded-xl border ${
-                timeWindow === window
-                  ? 'border-blue-400 bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
-                  : 'border-gray-300 text-gray-600 dark:border-gray-600 dark:text-gray-300'
-              } ${windowLoading ? 'opacity-70 cursor-wait' : ''}`}
-            >
-              {window.toUpperCase()}
-            </button>
-          ))}
-        </div>
-      </div>
+      {gatewayWarning && <GatewayWarningPage warning={gatewayWarning} className="mb-4" />}
 
-      {gatewayWarning && (
-        <GatewayWarningPage warning={gatewayWarning} className="mb-6" />
-      )}
+      <section className="mb-4 rounded-xl border border-gray-200 bg-white px-4 pt-4 shadow-sm dark:border-gray-700 dark:bg-gray-800 sm:px-5" aria-labelledby="uptime-trend-heading">
+        <div className="flex flex-wrap items-baseline justify-between gap-2"><div><h2 id="uptime-trend-heading" className="text-base font-semibold text-gray-950 dark:text-white">Gateway availability trend ({timeWindow.toUpperCase()})</h2><p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">Each point combines every gateway poll snapshot recorded on that calendar day.</p></div>{uptimeTrend.length > 0 && <span className="text-xs text-gray-500">{uptimeTrend.length} calendar day{uptimeTrend.length === 1 ? '' : 's'} with data</span>}</div>
+        {uptimeTrendLoading ? <div className="flex h-44 items-center justify-center text-sm text-gray-500">Loading availability trend…</div> : uptimeTrend.length > 0 ? <Suspense fallback={<div className="flex h-44 items-center justify-center text-sm text-gray-500">Loading chart…</div>}><UptimeTrendChart option={uptimeTrendOption} style={{ height: 210 }} notMerge lazyUpdate /></Suspense> : <div className="flex h-28 items-center justify-center text-sm text-gray-500">No gateway poll history is available for this window.</div>}
+      </section>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3 sm:gap-4 mb-6">
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4">
-          <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Total Gateways</div>
-          <div className="text-2xl font-bold text-gray-900 dark:text-white mt-2">{totals.total}</div>
+      <section className="mb-4 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-md dark:border-gray-700 dark:bg-gray-800">
+        <div className="border-b border-gray-200 p-4 dark:border-gray-700 sm:p-5">
+          <div className="flex flex-col justify-between gap-3 lg:flex-row lg:items-end"><div><h2 className="text-lg font-semibold text-gray-950 dark:text-white">Gateway directory</h2><p className="mt-1 text-sm text-gray-500 dark:text-gray-400">{filteredRows.length} of {rows.length} gateways · every row includes its 30-bucket availability strip, ordered oldest to newest.</p></div><div className="flex flex-col gap-2 sm:flex-row"><input value={gatewaySearch} onChange={(event) => setGatewaySearch(event.target.value)} aria-label="Search gateways" placeholder="Search gateway, node, endpoint" className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-900 dark:text-white" /><select value={gatewaySort} onChange={(event) => { const nextSort = event.target.value as GatewaySort; setGatewaySort(nextSort); setSortDirection(nextSort === 'status' ? 'asc' : 'desc'); }} aria-label="Sort gateways" className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"><option value="freshness">Last seen</option><option value="status">Status</option><option value="uptime">Uptime</option><option value="activity">Activity</option></select><button type="button" onClick={() => setSortDirection((value) => value === 'asc' ? 'desc' : 'asc')} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-200" title={`Sort ${sortDirection === 'asc' ? 'ascending' : 'descending'}`}>{sortDirection === 'asc' ? '↑ Asc' : '↓ Desc'}</button></div></div>
+          <div className="mt-3 flex gap-2 overflow-x-auto pb-1">{(['all', 'online', 'degraded', 'offline', 'unknown'] as GatewayFilter[]).map((filter) => <button key={filter} type="button" onClick={() => setGatewayFilter(filter)} className={`whitespace-nowrap rounded-full border px-3 py-1.5 text-xs font-medium capitalize ${gatewayFilter === filter ? 'border-blue-600 bg-blue-600 text-white' : 'border-gray-300 text-gray-600 dark:border-gray-600 dark:text-gray-300'}`}>{filter} ({filter === 'all' ? totals.total : totals[filter]})</button>)}</div>
+          <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400"><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-green-500" />Online</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-yellow-500" />Degraded</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-red-500" />Offline</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-gray-300 dark:bg-gray-600" />Unknown</span></div>
         </div>
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4">
-          <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Online</div>
-          <div className="text-2xl font-bold text-green-700 dark:text-green-300 mt-2">{totals.online}</div>
-        </div>
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4">
-          <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Degraded</div>
-          <div className="text-2xl font-bold text-yellow-700 dark:text-yellow-300 mt-2">{totals.degraded}</div>
-        </div>
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4">
-          <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Offline</div>
-          <div className="text-2xl font-bold text-red-700 dark:text-red-300 mt-2">{totals.offline}</div>
-        </div>
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4">
-          <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Vetted</div>
-          <div className="text-2xl font-bold text-blue-700 dark:text-blue-300 mt-2">{totals.vetted}</div>
-        </div>
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4 sm:col-span-2 xl:col-span-5">
-          <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Avg Uptime (Observed)</div>
-          <div className="text-2xl font-bold text-indigo-700 dark:text-indigo-300 mt-2">{avgUptime.toFixed(1)}%</div>
-          <div className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-            Window: {timeWindow.toUpperCase()} · Coverage: {avgCoverage.toFixed(1)}%
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 sm:gap-6 mb-6">
-        <div className="xl:col-span-2 bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4 sm:p-6">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-1">
-            Gateway Uptime ({timeWindow.toUpperCase()} Window)
-          </h2>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-            30-bucket availability strip over the selected window (newest at right).
-          </p>
-          <div className="text-xs text-gray-400 dark:text-gray-500 mb-3">oldest ← newest</div>
-          <div className="space-y-4">
-            {uptimeStrips.length === 0 && (
-              <div className="text-sm text-gray-500 dark:text-gray-400">No gateways discovered yet.</div>
-            )}
-            {uptimeStrips.map(({ gateway, strip }) => (
-              <div key={gateway.gateway_id}>
-                <div className="flex items-center justify-between text-xs sm:text-sm mb-2 gap-2">
-                  <span className="text-gray-900 dark:text-white font-medium truncate">
-                    {gateway.lightning_alias || shortId(gateway.gateway_id)}
-                  </span>
-                  <span className="text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                    {gateway.estimatedUptimePct.toFixed(1)}%
-                  </span>
-                </div>
-                <div className="flex gap-1">
-                  {strip.map((status, idx) => (
-                    <div
-                      key={`${gateway.gateway_id}-${idx}`}
-                      className={`h-3 flex-1 rounded-sm ${getUptimeStripClass(status)}`}
-                      title={getUptimeBucketLabel(idx, strip.length, windowMinutes)}
-                    />
-                  ))}
-                </div>
-              </div>
-            ))}
-            {uptimeStrips.length > 0 && (
-              <div className="flex items-center gap-4 pt-1 text-xs text-gray-500 dark:text-gray-400">
-                <div className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-green-500 dark:bg-green-400" /> Online</div>
-                <div className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-yellow-500 dark:bg-yellow-400" /> Degraded</div>
-                <div className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-red-500 dark:bg-red-400" /> Offline</div>
-                <div className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm bg-gray-300 dark:bg-gray-600" /> Unknown</div>
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-4 sm:p-6">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-1">
-            Most Active Gateways (Real {metricsWindow})
-          </h2>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
-            Ranked by real {metricsWindow} contract activity (fund/settle/cancel + volume).
-          </p>
-          {!hasRealActivityData && (
-            <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
-              No gateway contract events were found in the backend {metricsWindow} activity window.
-            </p>
-          )}
-          <div className="space-y-3">
-            {mostActive.map((gateway) => (
-              <div key={gateway.gateway_id} className="border border-gray-200 dark:border-gray-700 rounded-lg p-2.5">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="font-mono text-gray-900 dark:text-white">
-                    {gateway.lightning_alias || shortId(gateway.gateway_id)}
-                  </span>
-                  <span className="font-semibold text-gray-900 dark:text-white">
-                    {(gateway.realActivityScore ?? 0).toLocaleString()}
-                  </span>
-                </div>
-                <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                  {metricsWindow}: fund {gateway.fundCountWindow} · settle {gateway.settleCountWindow} · cancel {gateway.cancelCountWindow}
-                </div>
-                <div className="w-full h-2 mt-2 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
-                  <div
-                    className="h-full bg-blue-600"
-                    style={{
-                      width: `${
-                        mostActive[0] && (mostActive[0].realActivityScore ?? 0) > 0
-                          ? Math.max(
-                              8,
-                              ((gateway.realActivityScore ?? 0) / (mostActive[0].realActivityScore ?? 1)) * 100,
-                            )
-                          : 8
-                      }%`,
-                    }}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div className="relative overflow-x-auto bg-white dark:bg-gray-800 shadow-md rounded-lg border border-gray-200 dark:border-gray-700">
-        <div className="p-4 sm:p-5 text-lg font-semibold text-left text-gray-900 dark:text-white">
-          Gateway Details
-          <p className="mt-1 text-sm font-normal text-gray-500 dark:text-gray-400">
-            Complete list of gateways discovered for this federation.
-          </p>
-        </div>
-        <table className="w-full text-sm text-left text-gray-500 dark:text-gray-400">
-          <thead className="text-xs text-gray-700 uppercase bg-gray-100 dark:bg-gray-700 dark:text-gray-300">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[960px] table-fixed text-left text-sm text-gray-500 dark:text-gray-400">
+          <colgroup>
+            <col className="w-[22%]" />
+            <col className="w-[28%]" />
+            <col className="w-[17%]" />
+            <col className="w-[17%]" />
+            <col className="w-[16%]" />
+          </colgroup>
+          <thead className="bg-slate-50 text-xs uppercase tracking-wide text-gray-600 dark:bg-gray-700/70 dark:text-gray-300">
             <tr>
-              <th scope="col" className="px-4 sm:px-6 py-3">Gateway</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Status</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Uptime %</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Online</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Offline</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Unknown</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Activity</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Vetted</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">First Seen</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">Last Seen</th>
-              <th scope="col" className="px-4 sm:px-6 py-3">API Endpoint</th>
+              <th scope="col" className="px-4 py-3 sm:px-5">Gateway</th>
+              <th scope="col" className="px-4 py-3 sm:px-5">Availability</th>
+              <th scope="col" className="px-4 py-3 sm:px-5">Activity</th>
+              <th scope="col" className="px-4 py-3 sm:px-5">Trust & history</th>
+              <th scope="col" className="px-4 py-3 sm:px-5">Endpoint</th>
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
+            {filteredRows.length === 0 && (
               <tr className="bg-white border-b dark:bg-gray-800 dark:border-gray-700">
-                <td colSpan={11} className="px-4 sm:px-6 py-6 text-center text-gray-500 dark:text-gray-400">
-                  No gateways available for this federation yet.
+                <td colSpan={5} className="px-4 sm:px-6 py-6 text-center text-gray-500 dark:text-gray-400">
+                  No gateways match these filters.
                 </td>
               </tr>
             )}
 
-            {rows.map((gateway) => (
+            {visibleRows.map((gateway) => (
               <tr
                 key={gateway.gateway_id}
-                className="bg-white border-b dark:bg-gray-800 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/60 align-top"
+                className="align-top border-b border-gray-200 bg-white transition-colors last:border-b-0 hover:bg-blue-50/40 dark:border-gray-700 dark:bg-gray-800 dark:hover:bg-blue-950/20"
               >
-                <td className="px-4 sm:px-6 py-4">
-                  <div className="font-medium text-gray-900 dark:text-white">
+                <td className="px-4 py-4 sm:px-5">
+                  <div className="truncate font-semibold text-gray-950 dark:text-white" title={gateway.lightning_alias || 'Unnamed Gateway'}>
                     {gateway.lightning_alias || 'Unnamed Gateway'}
                   </div>
                   <div
@@ -812,35 +761,53 @@ export function FederationGateways() {
                     Node: {shortId(gateway.node_pub_key)}
                   </div>
                 </td>
-                <td className="px-4 sm:px-6 py-4">
-                  <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${statusClasses(gateway.status)}`}>
-                    {gateway.status}
-                  </span>
-                  <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    {formatRelative(gateway.lastSeenDate)}
+                <td className="px-4 py-4 sm:px-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusClasses(gateway.status)}`}>
+                      {gateway.status}
+                    </span>
+                    <span className="whitespace-nowrap text-xs text-gray-500 dark:text-gray-400">seen {formatRelative(gateway.lastSeenDate)}</span>
                   </div>
+                  <div className="mt-2 flex items-baseline justify-between gap-3">
+                    <span className="font-semibold text-gray-950 dark:text-white">{gateway.coveragePct > 0 ? `${gateway.estimatedUptimePct.toFixed(1)}% uptime` : 'No samples'}</span>
+                    <span className="text-xs text-gray-500 dark:text-gray-400">{gateway.coveragePct.toFixed(0)}% observed</span>
+                  </div>
+                  <div className="mt-2.5 flex gap-0.5" aria-label={`${timeWindow.toUpperCase()} availability, oldest to newest`}>
+                    {(uptimeStripByGatewayId.get(gateway.gateway_id) ?? []).map((status, index) => {
+                      const tooltip = getUptimeBucketTooltip(status, index, 30, windowMinutes);
+                      const tooltipPosition = index < 4
+                        ? 'left-0'
+                        : index > 25
+                          ? 'right-0'
+                          : 'left-1/2 -translate-x-1/2';
+
+                      return (
+                        <span
+                          key={`${gateway.gateway_id}-${index}`}
+                          tabIndex={0}
+                          aria-label={tooltip}
+                          title={tooltip}
+                          className="group relative h-3.5 flex-1 cursor-help rounded-[3px] outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-gray-800"
+                        >
+                          <span className={`block h-full rounded-[3px] transition-transform duration-150 group-hover:scale-y-125 group-focus:scale-y-125 ${getUptimeStripClass(status)}`} />
+                          <span className={`pointer-events-none absolute bottom-full z-20 mb-2 hidden w-max rounded-md bg-gray-950 px-2 py-1 text-[11px] font-medium text-white shadow-lg group-hover:block group-focus:block dark:bg-black ${tooltipPosition}`}>
+                            {tooltip}
+                          </span>
+                        </span>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-x-2 text-xs text-gray-500 dark:text-gray-400"><span>On {formatCompactDuration(gateway.estimatedOnlineMinutes)}</span><span>Off {formatCompactDuration(gateway.estimatedOfflineMinutes)}</span><span>Unknown {formatCompactDuration(gateway.estimatedUnknownMinutes)}</span></div>
                 </td>
-                <td className="px-4 sm:px-6 py-4 text-gray-700 dark:text-gray-300">
-                  {gateway.estimatedUptimePct.toFixed(1)}%
-                </td>
-                <td className="px-4 sm:px-6 py-4 text-gray-700 dark:text-gray-300">
-                  {formatDuration(gateway.estimatedOnlineMinutes)}
-                </td>
-                <td className="px-4 sm:px-6 py-4 text-gray-700 dark:text-gray-300">
-                  {formatDuration(gateway.estimatedOfflineMinutes)}
-                </td>
-                <td className="px-4 sm:px-6 py-4 text-gray-700 dark:text-gray-300">
-                  {formatDuration(gateway.estimatedUnknownMinutes)}
-                </td>
-                <td className="px-4 sm:px-6 py-4 text-gray-700 dark:text-gray-300">
+                <td className="px-4 py-4 text-gray-700 dark:text-gray-300 sm:px-5">
                   {gateway.realActivityScore !== null ? (
                     <>
-                      <div className="font-medium text-gray-900 dark:text-white">
-                        {gateway.realActivityScore.toLocaleString()}
+                      <div className="font-semibold text-gray-950 dark:text-white">
+                        {gateway.realActivityScore.toLocaleString()} <span className="text-xs font-normal text-gray-500 dark:text-gray-400">score</span>
                       </div>
-                      <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        {metricsWindow} F:{gateway.fundCountWindow} S:{gateway.settleCountWindow} C:{gateway.cancelCountWindow}<br />
-                        Vol: {formatMsats(gateway.totalVolumeMsatWindow)}
+                      <div className="mt-1 text-xs leading-5 text-gray-500 dark:text-gray-400">
+                        {metricsWindow} · {gateway.fundCountWindow} funds · {gateway.settleCountWindow} settles · {gateway.cancelCountWindow} cancels<br />
+                        {formatMsats(gateway.totalVolumeMsatWindow)} volume
                       </div>
                     </>
                   ) : (
@@ -849,42 +816,85 @@ export function FederationGateways() {
                     </div>
                   )}
                 </td>
-                <td className="px-4 sm:px-6 py-4">
-                  <span className={gateway.vetted ? 'text-green-600 dark:text-green-400' : 'text-gray-500 dark:text-gray-400'}>
-                    {gateway.vetted ? 'Yes' : 'No'}
+                <td className="px-4 py-4 sm:px-5">
+                  <span className={`text-sm font-medium ${gateway.vetted ? 'text-green-600 dark:text-green-400' : 'text-gray-500 dark:text-gray-400'}`}>
+                    {gateway.vetted ? '✓ Vetted' : 'Not vetted'}
                   </span>
+                  <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">First seen<br /><span className="text-gray-700 dark:text-gray-300">{formatDateTime(gateway.firstSeenDate)}</span></div>
+                  <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">Last seen<br /><span className="text-gray-700 dark:text-gray-300">{formatDateTime(gateway.lastSeenDate)}</span></div>
                 </td>
-                <td className="px-4 sm:px-6 py-4 text-gray-700 dark:text-gray-300">
-                  {formatDateTime(gateway.firstSeenDate)}
-                </td>
-                <td className="px-4 sm:px-6 py-4 text-gray-700 dark:text-gray-300">
-                  {formatDateTime(gateway.lastSeenDate)}
-                </td>
-                <td className="px-4 sm:px-6 py-4">
+                <td className="px-4 py-4 sm:px-5">
                   <a
                     href={gateway.api_endpoint}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-blue-600 dark:text-blue-400 hover:underline break-all"
+                    title={gateway.api_endpoint}
+                    className="block truncate font-medium text-blue-600 hover:underline dark:text-blue-400"
                   >
-                    {gateway.api_endpoint}
+                    {formatEndpointLabel(gateway.api_endpoint)}
                   </a>
                   {gateway.raw && (
-                    <details className="mt-2">
-                      <summary className="text-xs text-gray-600 dark:text-gray-400 cursor-pointer hover:text-gray-800 dark:hover:text-gray-200">
-                        Raw announcement
-                      </summary>
-                      <pre className="mt-2 text-[11px] p-2 rounded bg-gray-100 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 overflow-x-auto">
-                        {JSON.stringify(gateway.raw, null, 2)}
-                      </pre>
-                    </details>
+                    <button
+                      type="button"
+                      onClick={() => setRawAnnouncement({
+                        gatewayName: gateway.lightning_alias || shortId(gateway.gateway_id),
+                        raw: gateway.raw!,
+                      })}
+                      className="mt-2 text-xs text-gray-600 hover:text-blue-700 hover:underline dark:text-gray-400 dark:hover:text-blue-300"
+                    >
+                      View raw announcement
+                    </button>
                   )}
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
-      </div>
+        </div>
+        {filteredRows.length > visibleRows.length && (
+          <div className="border-t border-gray-200 p-4 text-center dark:border-gray-700">
+            <button
+              type="button"
+              onClick={() => setVisibleGatewayCount((count) => count + INITIAL_RENDER_COUNT)}
+              className="rounded-lg border border-blue-300 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-800 hover:bg-blue-100 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-200"
+            >
+              Show 50 more ({filteredRows.length - visibleRows.length} remaining)
+            </button>
+          </div>
+        )}
+      </section>
+      {rawAnnouncement && (
+        <div
+          role="presentation"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-gray-950/60 p-4 backdrop-blur-sm"
+          onMouseDown={() => setRawAnnouncement(null)}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="raw-announcement-title"
+            className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-900"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header className="flex items-center justify-between gap-4 border-b border-gray-200 px-5 py-4 dark:border-gray-700">
+              <div className="min-w-0">
+                <h2 id="raw-announcement-title" className="truncate font-semibold text-gray-950 dark:text-white">Raw announcement</h2>
+                <p className="truncate text-sm text-gray-500 dark:text-gray-400">{rawAnnouncement.gatewayName}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRawAnnouncement(null)}
+                className="rounded-lg px-3 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-100 hover:text-gray-950 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-white"
+              >
+                Close
+              </button>
+            </header>
+            <pre className="m-0 max-h-[68vh] overflow-auto bg-slate-950 p-5 text-xs leading-5 text-slate-100">
+              {JSON.stringify(rawAnnouncement.raw, null, 2)}
+            </pre>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

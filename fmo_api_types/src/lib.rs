@@ -65,6 +65,17 @@ pub enum FederationHealth {
     Offline,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoncesRequest {
+    pub nonces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NonceSpendInfo {
+    pub session_index: u64,
+    pub estimated_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Subset of a gateway's registration info suitable for public API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayInfo {
@@ -119,13 +130,11 @@ pub struct GatewayUptimeMetrics {
     pub uptime_pct: f64,
 }
 
+/// Federation-wide gateway availability aggregated into daily buckets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NoncesRequest {
-    pub nonces: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NonceSpendInfo {
-    pub session_index: u64,
-    pub estimated_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+pub struct GatewayUptimeTrendPoint {
+    pub day: DateTime<Utc>,
+    pub seen_samples: u64,
+    pub total_samples: u64,
+    pub uptime_pct: f64,
 }

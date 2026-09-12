@@ -12,7 +12,9 @@ use fedimint_core::encoding::Encodable;
 use fedimint_core::module::ApiRequestErased;
 use fedimint_ln_common::federation_endpoint_constants::LIST_GATEWAYS_ENDPOINT;
 use fedimint_ln_common::LightningGatewayAnnouncement;
-use fmo_api_types::{GatewayActivityMetrics, GatewayInfo, GatewayUptimeMetrics};
+use fmo_api_types::{
+    GatewayActivityMetrics, GatewayInfo, GatewayUptimeMetrics, GatewayUptimeTrendPoint,
+};
 use futures::future::join_all;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -76,15 +78,16 @@ pub(super) struct GetFederationGatewaysParams {
 pub(crate) async fn fetch_gateways_for_config(
     config: &ClientConfig,
 ) -> anyhow::Result<Vec<GatewayInfo>> {
-    let api = DynGlobalApi::from_endpoints(
-        config
-            .global
-            .api_endpoints
-            .iter()
-            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone())),
-        &None,
-    )
-    .await?;
+    let connectors = fedimint_connectors::ConnectorRegistry::build_from_client_env()?
+        .bind()
+        .await?;
+    let peers = config
+        .global
+        .api_endpoints
+        .iter()
+        .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
+        .collect();
+    let api = DynGlobalApi::new(connectors, peers, None)?;
 
     let ln_instance_id = config
         .modules
@@ -161,15 +164,13 @@ impl FederationObserver {
     ) -> anyhow::Result<()> {
         const POLL_INTERVAL: Duration = Duration::from_secs(GATEWAY_POLL_INTERVAL_MINUTES * 60);
 
-        let api = DynGlobalApi::from_endpoints(
-            config
-                .global
-                .api_endpoints
-                .iter()
-                .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone())),
-            &None,
-        )
-        .await?;
+        let peers = config
+            .global
+            .api_endpoints
+            .iter()
+            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
+            .collect();
+        let api = DynGlobalApi::new(self.connectors().clone(), peers, None)?;
 
         let ln_instance_id = config
             .modules
@@ -185,9 +186,9 @@ impl FederationObserver {
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         loop {
             interval.tick().await;
-            if let Err(e) =
-                Self::fetch_and_store_gateways(self, federation_id, &api, ln_instance_id, &peer_ids)
-                    .await
+            if let Err(e) = self
+                .fetch_and_store_gateways(federation_id, &api, ln_instance_id, &peer_ids)
+                .await
             {
                 warn!(
                     "Failed to fetch gateways for federation {}: {:?}",
@@ -607,6 +608,56 @@ impl FederationObserver {
             })
             .collect())
     }
+
+    async fn federation_gateway_uptime_trend(
+        &self,
+        federation_id: FederationId,
+        window: GatewayMetricsWindow,
+    ) -> anyhow::Result<Vec<GatewayUptimeTrendPoint>> {
+        #[derive(postgres_from_row::FromRow)]
+        struct TrendRow {
+            day: DateTime<Utc>,
+            seen_samples: i64,
+            total_samples: i64,
+        }
+
+        let conn = self.connection().await?;
+        let federation_id_bytes = federation_id.consensus_encode_to_vec();
+        let window_start = Utc::now() - window.duration();
+        let rows = query::<TrendRow>(
+            &conn,
+            "SELECT
+                 date_trunc('day', poll_time) AS day,
+                 COUNT(*) FILTER (WHERE is_seen)::bigint AS seen_samples,
+                 COUNT(*)::bigint AS total_samples
+             FROM gateway_poll_snapshots
+             WHERE federation_id = $1
+               AND poll_time >= $2
+             GROUP BY date_trunc('day', poll_time)
+             ORDER BY day ASC",
+            &[&federation_id_bytes, &window_start],
+        )
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let seen_samples = row.seen_samples.max(0) as u64;
+                let total_samples = row.total_samples.max(0) as u64;
+                let uptime_pct = if total_samples == 0 {
+                    0.0
+                } else {
+                    (seen_samples as f64 / total_samples as f64) * 100.0
+                };
+                GatewayUptimeTrendPoint {
+                    day: row.day,
+                    seen_samples,
+                    total_samples,
+                    uptime_pct,
+                }
+            })
+            .collect())
+    }
 }
 
 pub(super) async fn get_federation_gateways(
@@ -618,6 +669,19 @@ pub(super) async fn get_federation_gateways(
     Ok(state
         .federation_observer
         .list_federation_gateways(federation_id, window)
+        .await?
+        .into())
+}
+
+pub(super) async fn get_federation_gateway_uptime_trend(
+    Path(federation_id): Path<FederationId>,
+    Query(params): Query<GetFederationGatewaysParams>,
+    State(state): State<crate::AppState>,
+) -> crate::error::Result<Json<Vec<GatewayUptimeTrendPoint>>> {
+    let window = GatewayMetricsWindow::parse(params.window.as_deref())?;
+    Ok(state
+        .federation_observer
+        .federation_gateway_uptime_trend(federation_id, window)
         .await?
         .into())
 }

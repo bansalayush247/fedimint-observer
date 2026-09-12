@@ -6,8 +6,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Address, OutPoint, Txid};
 use chrono::{DateTime, NaiveDate};
 use deadpool_postgres::{GenericClient, Runtime, Transaction};
-use fedimint_api_client::api::net::Connector;
 use fedimint_api_client::api::DynGlobalApi;
+use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::core::DynModuleConsensusItem;
 use fedimint_core::encoding::Encodable;
@@ -52,6 +52,7 @@ pub struct FederationObserver {
     mempool_url: String,
     task_group: TaskGroup,
     consensus_meta_cache: ConsensusMetaCache,
+    connectors: ConnectorRegistry,
 }
 
 impl FederationObserver {
@@ -68,12 +69,15 @@ impl FederationObserver {
             pool_config.create_pool(Some(Runtime::Tokio1), NoTls)
         }?;
 
+        let connectors = ConnectorRegistry::build_from_client_env()?.bind().await?;
+
         let slf = FederationObserver {
             connection_pool,
             admin_auth: admin_auth.to_owned(),
             mempool_url: mempool_url.to_owned(),
             task_group: Default::default(),
             consensus_meta_cache: Default::default(),
+            connectors,
         };
 
         slf.setup_schema().await?;
@@ -90,6 +94,10 @@ impl FederationObserver {
             .spawn_cancellable("refresh views", Self::refresh_views(slf.clone()));
 
         Ok(slf)
+    }
+
+    pub fn connectors(&self) -> &ConnectorRegistry {
+        &self.connectors
     }
 
     async fn spawn_observer(&self, federation: Federation) {
@@ -447,9 +455,8 @@ impl FederationObserver {
             return Ok(federation_id);
         }
 
-        let config = Connector::default()
-            .download_from_invite_code(invite)
-            .await?;
+        let (config, _api) =
+            fedimint_api_client::download_from_invite_code(&self.connectors, invite).await?;
 
         self.connection()
             .await?
@@ -558,15 +565,13 @@ impl FederationObserver {
         federation_id: FederationId,
         config: ClientConfig,
     ) -> anyhow::Result<()> {
-        let api = DynGlobalApi::from_endpoints(
-            config
-                .global
-                .api_endpoints
-                .iter()
-                .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone())),
-            &None,
-        )
-        .await?;
+        let peers = config
+            .global
+            .api_endpoints
+            .iter()
+            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
+            .collect();
+        let api = DynGlobalApi::new(self.connectors.clone(), peers, None)?;
         let decoders = decoders_from_config(&config);
 
         info!("Starting background job for {federation_id}");
@@ -1423,13 +1428,17 @@ impl FederationObserver {
             .filter(|&health| *health == FederationHealth::Offline)
             .count() as u64;
 
+        // Reads the counters maintained by the triggers introduced in v9 instead of
+        // aggregating over `transactions` and `transaction_inputs`, which meant a full
+        // scan of both tables (~1.3GB) on every request.
         let totals = query_one::<FedimintTotalsResult>(
             &self.connection().await?,
             // language=postgresql
             "
-                SELECT (SELECT count(*) from federations)::bigint               as federations,
-                       (SELECT count(*) from transactions)::bigint               as tx_count,
-                       (SELECT sum(amount_msat) from transaction_inputs)::bigint as tx_volume
+                SELECT (SELECT count(*) from federations)::bigint as federations,
+                       COALESCE(sum(tx_count), 0)::bigint         as tx_count,
+                       COALESCE(sum(tx_volume_msat), 0)::bigint   as tx_volume
+                FROM federation_totals
             ",
             &[],
         )
