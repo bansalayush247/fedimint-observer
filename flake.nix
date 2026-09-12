@@ -41,17 +41,14 @@
           );
         };
 
-        rustSrc = flakeboxLib.filterSubPaths {
-          root = builtins.path {
-            name = "fmo";
-            path = ./.;
-          };
-          paths = [
-            "Cargo.toml"
-            "Cargo.lock"
-            ".cargo"
-            "fmo_api_types"
-            "fmo_server"
+        rustSrc = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            (lib.fileset.maybeMissing ./.cargo)
+            ./fmo_api_types
+            ./fmo_server
           ];
         };
 
