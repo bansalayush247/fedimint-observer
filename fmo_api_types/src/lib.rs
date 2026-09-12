@@ -84,7 +84,7 @@ pub struct GuardianClaimedUtxoOnchain {
     pub block_height: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianClaimedUtxoState {
     Spendable,

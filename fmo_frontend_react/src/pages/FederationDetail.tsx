@@ -5,6 +5,7 @@ import { api } from '../services/api';
 import type {
   FederationSummary,
   FederationUtxo,
+  GuardianClaimedUtxo,
   GuardianUtxoClaim,
   GuardianUtxoDisagreement,
 } from '../types/api';
@@ -13,7 +14,18 @@ import { Alert } from '../components/Alert';
 import { Copyable } from '../components/Copyable';
 
 const MSATS_PER_BTC = 100_000_000_000;
-const MAX_CLAIMED_UTXOS_PER_GUARDIAN = 5;
+
+type UtxoView = 'all' | 'matched' | 'guardian_confirmed' | 'reconciliation' | 'exception' | 'unverified';
+
+interface UtxoInventoryRow {
+  outPoint: string;
+  amount: number;
+  address: string | null;
+  guardianCount: number;
+  kind: Exclude<UtxoView, 'all'>;
+  detail?: string;
+  bitcoinStatus?: string;
+}
 
 // Lazy load the chart component for code splitting
 const TransactionChart = lazy(() => import('../components/TransactionChart').then(module => ({ default: module.TransactionChart })));
@@ -70,6 +82,8 @@ export function FederationDetail() {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'activity' | 'utxos' | 'config'>('activity');
   const [utxosLoading, setUtxosLoading] = useState(false);
+  const [utxoView, setUtxoView] = useState<UtxoView>('all');
+  const [utxoLimit, setUtxoLimit] = useState(25);
   const [rating, setRating] = useState(5);
   const [comment, setComment] = useState('');
   const [ratingError, setRatingError] = useState<string | null>(null);
@@ -88,6 +102,136 @@ export function FederationDetail() {
       (health) => health?.latest !== null && health?.latest !== undefined
     );
   }, [guardianHealth]);
+
+  const observerOnlyOutpoints = useMemo(() => {
+    return new Set(
+      utxoDisagreements
+        .filter((disagreement) => disagreement.description === 'observer has UTXO but no successful guardian claims it')
+        .map((disagreement) => disagreement.out_point)
+    );
+  }, [utxoDisagreements]);
+
+  const integrityDisagreementsByOutpoint = useMemo(() => {
+    return new Map(
+      utxoDisagreements
+        .filter((disagreement) => disagreement.description !== 'observer has UTXO but no successful guardian claims it')
+        .map((disagreement) => [disagreement.out_point, disagreement.description])
+    );
+  }, [utxoDisagreements]);
+
+  const successfulGuardianCount = useMemo(
+    () => guardianUtxoClaims.filter((claim) => claim.status === 'ok').length,
+    [guardianUtxoClaims]
+  );
+
+  const utxoInventory = useMemo(() => {
+    const observedByOutpoint = new Map(utxos.map((utxo) => [utxo.out_point, utxo]));
+    const guardianClaimsByOutpoint = new Map<string, { utxo: GuardianClaimedUtxo; guardianIds: Set<number> }>();
+
+    guardianUtxoClaims
+      .filter((claim) => claim.status === 'ok')
+      .forEach((claim) => claim.utxos
+        .filter((utxo) => utxo.state !== 'unsigned_peg_out' && utxo.state !== 'unconfirmed_peg_out')
+        .forEach((utxo) => {
+        const existing = guardianClaimsByOutpoint.get(utxo.out_point);
+        if (existing) {
+          existing.guardianIds.add(claim.guardian_id);
+        } else {
+          guardianClaimsByOutpoint.set(utxo.out_point, {
+            utxo,
+            guardianIds: new Set([claim.guardian_id]),
+          });
+        }
+      }));
+
+    const outpoints = new Set([
+      ...observedByOutpoint.keys(),
+      ...guardianClaimsByOutpoint.keys(),
+      ...integrityDisagreementsByOutpoint.keys(),
+    ]);
+
+    return [...outpoints]
+      .map((outPoint): UtxoInventoryRow => {
+        const observed = observedByOutpoint.get(outPoint);
+        const guardianClaim = guardianClaimsByOutpoint.get(outPoint);
+        const integrityDetail = integrityDisagreementsByOutpoint.get(outPoint);
+        const guardianCount = guardianClaim?.guardianIds.size ?? 0;
+
+        if (integrityDetail) {
+          return {
+            outPoint,
+            amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
+            address: observed?.address ?? guardianClaim?.utxo.onchain?.address ?? null,
+            guardianCount,
+            kind: 'exception',
+            detail: integrityDetail,
+            bitcoinStatus: bitcoinConfirmationLabel(guardianClaim?.utxo),
+          };
+        }
+
+        if (!observed && guardianClaim) {
+          const guardianConsensus = guardianCount === successfulGuardianCount;
+          return {
+            outPoint,
+            amount: guardianClaim.utxo.amount,
+            address: guardianClaim.utxo.onchain?.address ?? null,
+            guardianCount,
+            kind: guardianConsensus ? 'guardian_confirmed' : 'exception',
+            detail: guardianConsensus
+              ? 'Confirmed by every available guardian; observer history has not reconstructed its provenance.'
+              : 'Reported by only some available guardians; awaiting consistent wallet state.',
+            bitcoinStatus: bitcoinConfirmationLabel(guardianClaim.utxo),
+          };
+        }
+
+        if (observerOnlyOutpoints.has(outPoint) || !guardianClaim) {
+          const unverified = successfulGuardianCount === 0;
+          return {
+            outPoint,
+            amount: observed?.amount ?? 0,
+            address: observed?.address ?? null,
+            guardianCount,
+            kind: unverified ? 'unverified' : 'reconciliation',
+            detail: unverified
+              ? 'Awaiting a guardian wallet summary before reconciliation can run.'
+              : 'Observed but not claimed by a successful guardian.',
+            bitcoinStatus: bitcoinConfirmationLabel(guardianClaim?.utxo),
+          };
+        }
+
+        return {
+          outPoint,
+          amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
+          address: observed?.address ?? guardianClaim?.utxo.onchain?.address ?? null,
+          guardianCount,
+          kind: 'matched',
+          bitcoinStatus: bitcoinConfirmationLabel(guardianClaim?.utxo),
+        };
+      })
+      .sort((left, right) => left.outPoint.localeCompare(right.outPoint));
+  }, [guardianUtxoClaims, integrityDisagreementsByOutpoint, observerOnlyOutpoints, successfulGuardianCount, utxos]);
+
+  const utxoCounts = useMemo(() => ({
+    all: utxoInventory.length,
+    matched: utxoInventory.filter((utxo) => utxo.kind === 'matched').length,
+    guardian_confirmed: utxoInventory.filter((utxo) => utxo.kind === 'guardian_confirmed').length,
+    reconciliation: utxoInventory.filter((utxo) => utxo.kind === 'reconciliation').length,
+    exception: utxoInventory.filter((utxo) => utxo.kind === 'exception').length,
+    unverified: utxoInventory.filter((utxo) => utxo.kind === 'unverified').length,
+  }), [utxoInventory]);
+
+  const filteredUtxos = useMemo(
+    () => utxoView === 'all' ? utxoInventory : utxoInventory.filter((utxo) => utxo.kind === utxoView),
+    [utxoInventory, utxoView]
+  );
+
+  const guardianSummaryUnavailable = guardianUtxoClaims.length > 0 && successfulGuardianCount === 0;
+
+  const visibleUtxos = filteredUtxos.slice(0, utxoLimit);
+
+  useEffect(() => {
+    setUtxoLimit(25);
+  }, [id, utxoView]);
   
   // Calculate initial zoom to show last 3 months of data by default
   const initialZoom = useMemo(() => {
@@ -691,226 +835,112 @@ export function FederationDetail() {
                 message="The UTXO view is reconstructed from a combination of the public federation log and on-chain transactions, hence unconfirmed change UTXOs may be missing."
               />
 
-              <div className="mt-4 grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
-                <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-3 sm:p-4">
-                  <div className="text-xs text-gray-500 dark:text-gray-400 uppercase font-semibold">
-                    Guardian Claims
+              <section className="mt-5 overflow-hidden border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
+                <div className="flex flex-wrap items-end justify-between gap-3 border-b border-gray-200 px-4 py-4 dark:border-gray-700 sm:px-6">
+                  <div>
+                    <h2 className="text-base font-semibold text-gray-950 dark:text-white">Wallet UTXO Inventory</h2>
+                    <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                      One row per outpoint. Guardian agreement is shown alongside the reconstructed observer record.
+                    </p>
                   </div>
-                  <div className="mt-2 text-2xl font-bold text-gray-900 dark:text-white">
-                    {guardianUtxoClaims.filter((claim) => claim.status === 'ok').length}/{guardianUtxoClaims.length}
-                  </div>
-                  <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    guardians returned wallet summaries
-                  </div>
-                </div>
-                <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-3 sm:p-4">
-                  <div className="text-xs text-gray-500 dark:text-gray-400 uppercase font-semibold">
-                    Claimed UTXOs
-                  </div>
-                  <div className="mt-2 text-2xl font-bold text-gray-900 dark:text-white">
-                    {guardianUtxoClaims.reduce((sum, claim) => sum + claim.utxos.length, 0)}
-                  </div>
-                  <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    across all guardian responses
+                  <div className="text-xs text-gray-500 dark:text-gray-400">
+                    {successfulGuardianCount} of {guardianUtxoClaims.length} guardian responses available
                   </div>
                 </div>
-                <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 p-3 sm:p-4">
-                  <div className="text-xs text-gray-500 dark:text-gray-400 uppercase font-semibold">
-                    Disagreements
+                {guardianSummaryUnavailable && (
+                  <div className="border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200 sm:px-6">
+                    Guardian wallet summaries are unavailable, so reconciliation results cannot be verified yet.
                   </div>
-                  <div className="mt-2 text-2xl font-bold text-gray-900 dark:text-white">
-                    {utxoDisagreements.length}
-                  </div>
-                  <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    observer vs guardian claim checks
-                  </div>
+                )}
+
+                <div className="grid grid-cols-2 border-b border-gray-200 dark:border-gray-700 md:grid-cols-3 xl:grid-cols-6">
+                  {([
+                    ['all', 'All', 'text-gray-900 dark:text-white'],
+                    ['matched', 'Matched', 'text-emerald-700 dark:text-emerald-300'],
+                    ['guardian_confirmed', 'Guardian confirmed', 'text-sky-700 dark:text-sky-300'],
+                    ['reconciliation', 'Reconciliation', 'text-amber-700 dark:text-amber-300'],
+                    ['exception', 'Exceptions', 'text-rose-700 dark:text-rose-300'],
+                    ['unverified', 'Unverified', 'text-gray-700 dark:text-gray-300'],
+                  ] as const).map(([view, label, color]) => (
+                    <button
+                      key={view}
+                      type="button"
+                      onClick={() => setUtxoView(view)}
+                      className={`min-h-24 border-b border-r border-gray-200 p-4 text-left transition-colors last:border-r-0 hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-700/50 lg:border-b-0 ${utxoView === view ? 'bg-gray-100 dark:bg-gray-700/70' : ''}`}
+                    >
+                      <div className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{label}</div>
+                      <div className={`mt-2 text-2xl font-semibold ${color}`}>{utxoCounts[view]}</div>
+                    </button>
+                  ))}
                 </div>
-              </div>
 
-              {guardianUtxoClaims.length > 0 && (
-                <div className="mt-4 relative shadow-md sm:rounded-lg">
-                  <div className="bg-gray-100 dark:bg-gray-700 px-3 sm:px-6 py-3 text-xs text-gray-700 dark:text-gray-400 uppercase font-semibold">
-                    Guardian Wallet Claims
-                  </div>
-                  <div className="divide-y divide-gray-200 dark:divide-gray-700">
-                    {guardianUtxoClaims.map((claim) => {
-                      const claimedTotalMsats = claim.utxos.reduce((sum, utxo) => sum + utxo.amount, 0);
-                      const stateCounts = summarizeGuardianClaimStates(claim);
-                      const visibleUtxos = claim.utxos.slice(0, MAX_CLAIMED_UTXOS_PER_GUARDIAN);
-                      const hiddenUtxoCount = claim.utxos.length - visibleUtxos.length;
-
-                      return (
-                        <div key={claim.guardian_id} className="bg-white dark:bg-gray-800 px-3 sm:px-6 py-3 sm:py-4">
-                          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
-                            <div className="min-w-0 flex-1">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <div className="text-xs sm:text-sm font-semibold text-gray-900 dark:text-white">
-                                  Guardian {claim.guardian_id}
-                                </div>
-                                <Badge level={claim.status === 'ok' ? 'success' : claim.status === 'error' ? 'error' : 'warning'}>
-                                  {claim.status}
-                                </Badge>
-                              </div>
-
-                              {claim.error && (
-                                <div className="mt-1 text-[10px] sm:text-xs text-red-600 dark:text-red-400 break-words">
-                                  {claim.error}
-                                </div>
-                              )}
-
-                              {stateCounts.length > 0 && (
-                                <div className="mt-3 flex flex-wrap gap-2">
-                                  {stateCounts.map(([state, count]) => (
-                                    <span
-                                      key={`${claim.guardian_id}-${state}`}
-                                      className="inline-flex items-center rounded-md bg-gray-100 dark:bg-gray-700 px-2 py-1 text-[10px] sm:text-xs text-gray-700 dark:text-gray-300"
-                                    >
-                                      {formatUtxoState(state)}: {count}
-                                    </span>
-                                  ))}
-                                </div>
-                              )}
-
-                              {visibleUtxos.length > 0 && (
-                                <div className="mt-3 space-y-2">
-                                  {visibleUtxos.map((utxo) => (
-                                    <div key={`${claim.guardian_id}-${utxo.out_point}`} className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 rounded-md bg-gray-50 dark:bg-gray-900/50 px-2 py-2">
-                                      <div className="min-w-0">
-                                        <a
-                                          href={mempoolTxUrl(utxo.out_point)}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          className="font-mono text-[10px] sm:text-xs text-blue-600 underline dark:text-blue-400 hover:no-underline break-all"
-                                        >
-                                          {utxo.out_point}
-                                        </a>
-                                        {utxo.onchain?.address && (
-                                          <a
-                                            href={mempoolAddressUrl(utxo.onchain.address)}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="mt-1 block font-mono text-[10px] sm:text-xs text-gray-500 underline dark:text-gray-400 hover:no-underline break-all"
-                                          >
-                                            {utxo.onchain.address}
-                                          </a>
-                                        )}
-                                        {utxo.onchain && !utxo.onchain.address && (
-                                          <div className="mt-1 font-mono text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 break-all">
-                                            script {utxo.onchain.script_pubkey}
-                                          </div>
-                                        )}
-                                        {utxo.resolution_error && (
-                                          <div className="mt-1 text-[10px] sm:text-xs text-red-600 dark:text-red-400 break-words">
-                                            {utxo.resolution_error}
-                                          </div>
-                                        )}
-                                      </div>
-                                      <div className="flex items-center gap-2 text-[10px] sm:text-xs text-gray-600 dark:text-gray-400 shrink-0">
-                                        <span>{formatUtxoState(utxo.state)}</span>
-                                        {utxo.onchain && (
-                                          <span>{utxo.onchain.confirmed ? `Block ${utxo.onchain.block_height ?? 'confirmed'}` : 'Unconfirmed'}</span>
-                                        )}
-                                        <span className="font-mono text-gray-900 dark:text-white">
-                                          {formatMsatsAsBtc(utxo.amount)}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  ))}
-                                  {hiddenUtxoCount > 0 && (
-                                    <div className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">
-                                      +{hiddenUtxoCount} more claimed UTXOs
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-
-                            <div className="sm:text-right shrink-0">
-                              <div className="text-xs sm:text-sm text-gray-700 dark:text-gray-300 font-mono">
-                                {claim.utxos.length} UTXOs
-                              </div>
-                              <div className="mt-1 text-xs sm:text-sm text-gray-900 dark:text-white font-mono">
-                                {formatMsatsAsBtc(claimedTotalMsats)}
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {utxoDisagreements.length > 0 && (
-                <div className="mt-4 relative shadow-md sm:rounded-lg">
-                  <div className="bg-red-50 dark:bg-red-900/30 px-3 sm:px-6 py-3 text-xs text-red-700 dark:text-red-300 uppercase font-semibold">
-                    UTXO Disagreements
-                  </div>
-                  <div className="divide-y divide-red-100 dark:divide-red-900/50">
-                    {utxoDisagreements.map((disagreement, index) => (
-                      <div key={`${disagreement.out_point}-${index}`} className="bg-white dark:bg-gray-800 px-3 sm:px-6 py-3 sm:py-4">
-                        <div className="font-mono text-[10px] sm:text-xs text-gray-900 dark:text-white break-all">
-                          {disagreement.out_point}
-                        </div>
-                        <div className="mt-1 text-xs sm:text-sm text-red-600 dark:text-red-400">
-                          {disagreement.description}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <div className="mt-4 relative shadow-md sm:rounded-lg">
-                <div className="bg-gray-100 dark:bg-gray-700 px-3 sm:px-6 py-3 text-xs text-gray-700 dark:text-gray-400 uppercase font-semibold">
-                  Observed UTXOs ({utxos.length} total)
+                <div className="grid grid-cols-[minmax(13rem,1fr)_auto] gap-4 border-b border-gray-200 bg-gray-50 px-4 py-2 text-[11px] font-medium uppercase tracking-wide text-gray-500 dark:border-gray-700 dark:bg-gray-900/40 dark:text-gray-400 sm:grid-cols-[minmax(16rem,1fr)_auto_auto_auto] sm:px-6">
+                  <div>Outpoint and address</div>
+                  <div className="hidden sm:block">Guardian reports</div>
+                  <div className="hidden sm:block">Status</div>
+                  <div>Amount</div>
                 </div>
                 <div className="divide-y divide-gray-200 dark:divide-gray-700">
                   {utxosLoading ? (
                     <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
                       Loading UTXOs...
                     </div>
-                  ) : utxos.length === 0 ? (
+                  ) : filteredUtxos.length === 0 ? (
                     <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
                       No UTXOs found
                     </div>
                   ) : (
-                    utxos.map((utxo, index) => (
-                      <div key={index} className="bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 px-3 sm:px-6 py-3 sm:py-4">
-                        <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
-                          <div className="flex-1 min-w-0">
-                            <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">UTXO</span>
-                            <a
-                              href={mempoolTxUrl(utxo.out_point)}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-blue-600 underline dark:text-blue-500 hover:no-underline font-mono text-[10px] sm:text-xs block truncate"
-                              title={utxo.out_point}
-                            >
-                              {utxo.out_point}
-                            </a>
+                    visibleUtxos.map((utxo) => (
+                      <div key={utxo.outPoint} className="grid grid-cols-[minmax(13rem,1fr)_auto] gap-4 px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-700/40 sm:grid-cols-[minmax(16rem,1fr)_auto_auto_auto] sm:px-6">
+                        <div className="min-w-0">
+                          <a
+                            href={mempoolTxUrl(utxo.outPoint)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="block truncate font-mono text-xs text-blue-700 underline hover:no-underline dark:text-blue-400"
+                            title={utxo.outPoint}
+                          >
+                            {utxo.outPoint}
+                          </a>
+                          {utxo.address && (
                             <a
                               href={mempoolAddressUrl(utxo.address)}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="mt-1 text-gray-500 underline dark:text-gray-400 hover:no-underline font-mono text-[10px] sm:text-xs block truncate"
+                              className="mt-1 block truncate font-mono text-[11px] text-gray-500 underline hover:no-underline dark:text-gray-400"
                               title={utxo.address}
                             >
                               {utxo.address}
                             </a>
-                          </div>
-                          <div className="sm:text-right shrink-0">
-                            <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Amount</span>
-                            <span className="text-xs sm:text-sm text-gray-900 dark:text-white font-mono whitespace-nowrap">
-                              {formatMsatsAsBtc(utxo.amount)}
-                            </span>
-                          </div>
+                          )}
+                          {utxo.detail && <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{utxo.detail}</p>}
+                          {utxo.bitcoinStatus && <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{utxo.bitcoinStatus}</p>}
+                        </div>
+                        <div className="hidden whitespace-nowrap text-xs text-gray-600 dark:text-gray-300 sm:block">
+                          {utxo.guardianCount} / {successfulGuardianCount}
+                        </div>
+                        <div className={`hidden whitespace-nowrap text-xs font-medium sm:block ${utxo.kind === 'matched' ? 'text-emerald-700 dark:text-emerald-300' : utxo.kind === 'guardian_confirmed' ? 'text-sky-700 dark:text-sky-300' : utxo.kind === 'reconciliation' ? 'text-amber-700 dark:text-amber-300' : utxo.kind === 'unverified' ? 'text-gray-700 dark:text-gray-300' : 'text-rose-700 dark:text-rose-300'}`}>
+                          {utxo.kind === 'matched' ? 'Matched' : utxo.kind === 'guardian_confirmed' ? 'Guardian confirmed' : utxo.kind === 'reconciliation' ? 'Checking spend' : utxo.kind === 'unverified' ? 'Awaiting guardian' : 'Exception'}
+                        </div>
+                        <div className="whitespace-nowrap text-right font-mono text-xs text-gray-900 dark:text-white">
+                          {formatMsatsAsBtc(utxo.amount)}
                         </div>
                       </div>
                     ))
                   )}
                 </div>
-              </div>
+                {visibleUtxos.length < filteredUtxos.length && (
+                  <div className="border-t border-gray-200 px-4 py-3 dark:border-gray-700 sm:px-6">
+                    <button
+                      type="button"
+                      onClick={() => setUtxoLimit((current) => current + 25)}
+                      className="text-xs font-semibold text-blue-700 underline hover:no-underline dark:text-blue-400"
+                    >
+                      Show 25 more UTXOs ({filteredUtxos.length - visibleUtxos.length} remaining)
+                    </button>
+                  </div>
+                )}
+              </section>
             </>
           )}
 
@@ -940,21 +970,18 @@ function mempoolAddressUrl(address: string): string {
   return `https://mempool.space/address/${address}`;
 }
 
-function formatUtxoState(state: string): string {
-  return state
-    .split('_')
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
+function bitcoinConfirmationLabel(utxo?: GuardianClaimedUtxo): string | undefined {
+  if (!utxo?.onchain) {
+    return undefined;
+  }
+  if (!utxo.onchain.confirmed) {
+    return 'Bitcoin transaction is unconfirmed.';
+  }
+  return utxo.onchain.block_height === null
+    ? 'Confirmed on Bitcoin.'
+    : `Confirmed on Bitcoin at block ${utxo.onchain.block_height}.`;
 }
 
-function summarizeGuardianClaimStates(claim: GuardianUtxoClaim): Array<[string, number]> {
-  const counts = claim.utxos.reduce<Record<string, number>>((acc, utxo) => {
-    acc[utxo.state] = (acc[utxo.state] || 0) + 1;
-    return acc;
-  }, {});
-
-  return Object.entries(counts).sort(([left], [right]) => left.localeCompare(right));
-}
 
 async function fetchFederationConfig(federationId: string, inviteCode: string): Promise<FederationConfig> {
   const BASE_URL = import.meta.env.VITE_FMO_API_BASE_URL || 'https://observer.fedimint.org/api';

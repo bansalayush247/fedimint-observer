@@ -14,15 +14,16 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_auth::AuthBearer;
-use bitcoin::OutPoint;
+use bitcoin::hashes::Hash;
+use bitcoin::{OutPoint, Txid};
 use fedimint_core::config::{ClientConfig, FederationId, JsonClientConfig};
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fmo_api_types::{
     FederationSummary, FederationUtxo, FederationUtxosResponse, FedimintTotals,
-    GuardianClaimedUtxo, GuardianUtxoClaim, GuardianUtxoClaimStatus, GuardianUtxoDisagreement,
-    NonceSpendInfo, NoncesRequest,
+    GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus,
+    GuardianUtxoDisagreement, NonceSpendInfo, NoncesRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -141,7 +142,7 @@ async fn get_federation_utxos(
     Path(federation_id): Path<FederationId>,
     State(state): State<AppState>,
 ) -> crate::error::Result<Json<FederationUtxosResponse>> {
-    let utxos = state
+    let mut utxos = state
         .federation_observer
         .federation_utxos(federation_id)
         .await?;
@@ -149,10 +150,20 @@ async fn get_federation_utxos(
         .federation_observer
         .guardian_utxo_claims(federation_id)
         .await?;
+    let completed_peg_out_recipients = state
+        .federation_observer
+        .federation_peg_out_recipient_outpoints(federation_id)
+        .await?;
+    for claim in &mut guardian_claims {
+        claim
+            .utxos
+            .retain(|utxo| !completed_peg_out_recipients.contains(&utxo.out_point));
+    }
     state
         .federation_observer
         .enrich_guardian_claims_onchain(&mut guardian_claims)
         .await;
+    normalize_observed_utxo_outpoints(&mut utxos, &guardian_claims);
     let disagreements = guardian_utxo_disagreements(&utxos, &guardian_claims);
     Ok(FederationUtxosResponse {
         observed: utxos,
@@ -160,6 +171,54 @@ async fn get_federation_utxos(
         disagreements,
     }
     .into())
+}
+
+fn normalize_observed_utxo_outpoints(
+    observed: &mut [FederationUtxo],
+    guardian_claims: &[GuardianUtxoClaim],
+) {
+    let claimed_outpoints = guardian_claims
+        .iter()
+        .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Ok))
+        .flat_map(|claim| {
+            claim
+                .utxos
+                .iter()
+                .filter(|utxo| is_observer_utxo_claim(utxo))
+                .map(|utxo| utxo.out_point)
+        })
+        .collect::<HashSet<_>>();
+
+    for utxo in observed {
+        utxo.out_point = normalize_observed_outpoint(utxo.out_point, &claimed_outpoints);
+    }
+}
+
+fn normalize_observed_outpoint(
+    observed_outpoint: OutPoint,
+    claimed_outpoints: &HashSet<OutPoint>,
+) -> OutPoint {
+    let reversed_outpoint = outpoint_with_reversed_txid(observed_outpoint);
+    claimed_outpoints
+        .contains(&reversed_outpoint)
+        .then_some(reversed_outpoint)
+        .unwrap_or(observed_outpoint)
+}
+
+fn outpoint_with_reversed_txid(outpoint: OutPoint) -> OutPoint {
+    let mut txid_bytes = outpoint.txid.to_byte_array();
+    txid_bytes.reverse();
+    OutPoint {
+        txid: Txid::from_byte_array(txid_bytes),
+        vout: outpoint.vout,
+    }
+}
+
+fn is_observer_utxo_claim(utxo: &GuardianClaimedUtxo) -> bool {
+    !matches!(
+        utxo.state,
+        GuardianClaimedUtxoState::UnsignedPegOut | GuardianClaimedUtxoState::UnconfirmedPegOut
+    )
 }
 
 fn guardian_utxo_disagreements(
@@ -176,14 +235,7 @@ fn guardian_utxo_disagreements(
         .collect::<Vec<_>>();
 
     if successful_claims.is_empty() {
-        return if guardian_claims.is_empty() {
-            Vec::new()
-        } else {
-            vec![GuardianUtxoDisagreement {
-                out_point: OutPoint::null(),
-                description: "no guardian wallet summaries could be fetched".to_owned(),
-            }]
-        };
+        return Vec::new();
     }
 
     let claimed_by_outpoint = successful_claims
@@ -192,6 +244,7 @@ fn guardian_utxo_disagreements(
             claim
                 .utxos
                 .iter()
+                .filter(|utxo| is_observer_utxo_claim(utxo))
                 .map(|utxo| (utxo.out_point, (claim.guardian_id, utxo)))
         })
         .fold(
@@ -206,6 +259,9 @@ fn guardian_utxo_disagreements(
 
     for claim in &successful_claims {
         for utxo in &claim.utxos {
+            if !is_observer_utxo_claim(utxo) {
+                continue;
+            }
             if let Some(onchain) = &utxo.onchain {
                 if onchain.amount != utxo.amount {
                     disagreements.push(GuardianUtxoDisagreement {
@@ -312,6 +368,7 @@ fn guardian_utxo_disagreements(
         let guardian_outpoints = claim
             .utxos
             .iter()
+            .filter(|utxo| is_observer_utxo_claim(utxo))
             .map(|utxo| utxo.out_point)
             .collect::<HashSet<_>>();
         for out_point in claimed_by_outpoint.keys() {
@@ -393,4 +450,41 @@ async fn get_nonces_spend_info(
         .get_nonces_spend_info(federation_id, &request.nonces)
         .await?
         .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{normalize_observed_outpoint, outpoint_with_reversed_txid};
+    use bitcoin::OutPoint;
+
+    #[test]
+    fn reverses_txid_without_changing_vout() {
+        let guardian_txid = "d88e55afef8cdc5bd306bf4e5a5d1a202fd89ee50592a5b6c56c8ba5da71e305"
+            .parse()
+            .unwrap();
+        let guardian_outpoint = OutPoint {
+            txid: guardian_txid,
+            vout: 1,
+        };
+        let observed_outpoint = outpoint_with_reversed_txid(guardian_outpoint);
+
+        assert_eq!(
+            observed_outpoint.to_string(),
+            "05e371daa58b6cc5b6a59205e59ed82f201a5d5a4ebf06d35bdc8cefaf558ed8:1"
+        );
+        assert_eq!(
+            outpoint_with_reversed_txid(observed_outpoint),
+            guardian_outpoint
+        );
+        assert_eq!(
+            normalize_observed_outpoint(observed_outpoint, &HashSet::from([guardian_outpoint])),
+            guardian_outpoint
+        );
+        assert_eq!(
+            normalize_observed_outpoint(observed_outpoint, &HashSet::new()),
+            observed_outpoint
+        );
+    }
 }
