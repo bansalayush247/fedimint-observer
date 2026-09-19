@@ -28,9 +28,12 @@ export interface FederationUtxo {
   address: string;
   out_point: string;
   amount: number;
+  onchain?: GuardianClaimedUtxoOnchain;
+  resolution_error?: string;
 }
 
 export interface FederationUtxosResponse {
+  reconstruction_complete: boolean;
   observed: FederationUtxo[];
   guardian_claims: GuardianUtxoClaim[];
   disagreements: GuardianUtxoDisagreement[];
@@ -56,6 +59,7 @@ export interface GuardianClaimedUtxoOnchain {
   address: string | null;
   amount: number;
   confirmed: boolean;
+  spent: boolean;
   block_height: number | null;
 }
 
@@ -67,6 +71,7 @@ export type GuardianClaimedUtxoState =
   | 'unconfirmed_change';
 
 export interface GuardianUtxoDisagreement {
+  kind: 'evidence_mismatch' | 'inventory_difference';
   out_point: string;
   description: string;
 }

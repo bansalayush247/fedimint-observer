@@ -39,10 +39,15 @@ pub struct FederationUtxo {
     pub address: bitcoin::Address<NetworkUnchecked>,
     pub out_point: bitcoin::OutPoint,
     pub amount: Amount,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onchain: Option<GuardianClaimedUtxoOnchain>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationUtxosResponse {
+    pub reconstruction_complete: bool,
     pub observed: Vec<FederationUtxo>,
     pub guardian_claims: Vec<GuardianUtxoClaim>,
     pub disagreements: Vec<GuardianUtxoDisagreement>,
@@ -81,6 +86,7 @@ pub struct GuardianClaimedUtxoOnchain {
     pub address: Option<String>,
     pub amount: Amount,
     pub confirmed: bool,
+    pub spent: bool,
     pub block_height: Option<u32>,
 }
 
@@ -96,8 +102,16 @@ pub enum GuardianClaimedUtxoState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardianUtxoDisagreement {
+    pub kind: GuardianUtxoDisagreementKind,
     pub out_point: bitcoin::OutPoint,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianUtxoDisagreementKind {
+    EvidenceMismatch,
+    InventoryDifference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
