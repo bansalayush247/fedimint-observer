@@ -51,31 +51,4 @@ WHERE NOT EXISTS (
 )
 ORDER BY c.on_chain_txid, c.on_chain_vout, c.ownership_priority;
 CREATE UNIQUE INDEX on_chain_txid_on_chain_vout ON utxos(on_chain_txid, on_chain_vout);
--- Bitcoin verification is deliberately independent of a page request. Results
--- are shared by every federation because an outpoint is globally unique.
-CREATE TABLE bitcoin_outpoint_verifications (
-    txid BYTEA NOT NULL CHECK (octet_length(txid) = 32),
-    vout INTEGER NOT NULL CHECK (vout >= 0),
-    script_pubkey TEXT,
-    address TEXT,
-    amount_msat BIGINT CHECK (amount_msat >= 0),
-    confirmed BOOLEAN,
-    spent BOOLEAN,
-    block_height INTEGER CHECK (block_height >= 0),
-    last_error TEXT,
-    checked_at TIMESTAMPTZ,
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    failure_count SMALLINT NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
-    PRIMARY KEY (txid, vout),
-    CHECK (
-        (script_pubkey IS NULL AND address IS NULL AND amount_msat IS NULL
-            AND confirmed IS NULL AND spent IS NULL AND block_height IS NULL)
-        OR
-        (script_pubkey IS NOT NULL AND amount_msat IS NOT NULL
-            AND confirmed IS NOT NULL AND spent IS NOT NULL)
-    )
-);
-CREATE INDEX bitcoin_outpoint_verifications_refresh_idx
-    ON bitcoin_outpoint_verifications(next_retry_at, last_seen_at);
 INSERT INTO schema_version(version) VALUES (11);

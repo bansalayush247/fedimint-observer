@@ -15,7 +15,7 @@ import { Copyable } from '../components/Copyable';
 
 const MSATS_PER_BTC = 100_000_000_000;
 
-type UtxoView = 'all' | 'matched' | 'partial' | 'reconciliation' | 'exception' | 'unverified';
+type UtxoView = 'all' | 'verified' | 'pending' | 'mismatch';
 
 interface UtxoInventoryRow {
   outPoint: string;
@@ -24,7 +24,6 @@ interface UtxoInventoryRow {
   guardianCount: number;
   kind: Exclude<UtxoView, 'all'>;
   detail?: string;
-  bitcoinStatus?: string;
 }
 
 // Lazy load the chart component for code splitting
@@ -104,14 +103,6 @@ export function FederationDetail() {
     );
   }, [guardianHealth]);
 
-  const observerOnlyOutpoints = useMemo(() => {
-    return new Set(
-      utxoDisagreements
-        .filter((disagreement) => disagreement.description === 'observer has UTXO but no successful guardian claims it')
-        .map((disagreement) => disagreement.out_point)
-    );
-  }, [utxoDisagreements]);
-
   const integrityDisagreementsByOutpoint = useMemo(() => {
     return new Map(
       utxoDisagreements
@@ -158,26 +149,13 @@ export function FederationDetail() {
         const guardianClaim = guardianClaimsByOutpoint.get(outPoint);
         const integrityDetail = integrityDisagreementsByOutpoint.get(outPoint);
         const guardianCount = guardianClaim?.guardianIds.size ?? 0;
-        const evidence = observed ?? guardianClaim?.utxo;
-
         const pendingStates = [...(guardianClaim?.states ?? [])].filter((state) => state !== 'spendable');
-        if (!integrityDetail && (!reconstructionComplete || pendingStates.length > 0)) {
+        if (!integrityDetail && pendingStates.length > 0) {
           return {
             outPoint, amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
-            address: observed?.address ?? guardianClaim?.utxo.onchain?.address ?? null,
-            guardianCount, kind: 'reconciliation',
+            address: observed?.address ?? null,
+            guardianCount, kind: 'pending',
             detail: !reconstructionComplete ? 'Wallet history is still being rebuilt.' : `This output is still pending: ${pendingStates.map((state) => state.replaceAll('_', ' ')).join(', ')}.`,
-            bitcoinStatus: bitcoinConfirmationLabel(evidence),
-          };
-        }
-
-        if (!integrityDetail && evidence?.onchain?.spent) {
-          return {
-            outPoint, amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
-            address: observed?.address ?? guardianClaim?.utxo.onchain?.address ?? null,
-            guardianCount, kind: 'reconciliation',
-            detail: 'This Bitcoin output has already been spent. The wallet data may still be catching up.',
-            bitcoinStatus: bitcoinConfirmationLabel(evidence),
           };
         }
 
@@ -185,11 +163,10 @@ export function FederationDetail() {
           return {
             outPoint,
             amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
-            address: observed?.address ?? guardianClaim?.utxo.onchain?.address ?? null,
+            address: observed?.address ?? null,
             guardianCount,
-            kind: 'exception',
+            kind: 'mismatch',
             detail: integrityDetail,
-            bitcoinStatus: bitcoinConfirmationLabel(evidence),
           };
         }
 
@@ -197,64 +174,59 @@ export function FederationDetail() {
           return {
             outPoint,
             amount: guardianClaim.utxo.amount,
-            address: guardianClaim.utxo.onchain?.address ?? null,
+            address: null,
             guardianCount,
-            kind: 'unverified',
+            kind: 'pending',
             detail: 'Only guardians reported this. Observer history has not confirmed it yet.',
-            bitcoinStatus: bitcoinConfirmationLabel(guardianClaim.utxo),
           };
         }
 
-        if (observerOnlyOutpoints.has(outPoint) || !guardianClaim) {
-          const unverified = successfulGuardianCount === 0;
+        if (!guardianClaim) {
+          const pending = successfulGuardianCount === 0 || !reconstructionComplete;
           return {
             outPoint,
             amount: observed?.amount ?? 0,
             address: observed?.address ?? null,
             guardianCount,
-            kind: unverified ? 'unverified' : 'reconciliation',
-            detail: unverified
+            kind: pending ? 'pending' : 'mismatch',
+            detail: pending
               ? 'Waiting for guardian wallet data.'
               : 'Found in observer history, but not reported by any responding guardian.',
-            bitcoinStatus: bitcoinConfirmationLabel(evidence),
           };
         }
 
         return {
           outPoint,
           amount: observed?.amount ?? guardianClaim.utxo.amount,
-          address: observed?.address ?? guardianClaim.utxo.onchain?.address ?? null,
+          address: observed?.address ?? null,
           guardianCount,
-          kind: evidence?.onchain && guardianCount === guardianUtxoClaims.length ? 'matched' : evidence?.onchain ? 'partial' : 'unverified',
-          detail: evidence?.onchain
-              ? guardianCount === guardianUtxoClaims.length
-                ? 'Matched with observer history, guardian data, and Bitcoin.'
-                : `Verified against Bitcoin and ${guardianCount} responding guardian${guardianCount === 1 ? '' : 's'}; ${guardianUtxoClaims.length - guardianCount} guardian response${guardianUtxoClaims.length - guardianCount === 1 ? '' : 's'} missing.`
-            : evidence?.resolution_error === BITCOIN_VERIFICATION_QUEUED
-              ? 'Bitcoin verification is queued. Refresh this page shortly.'
-              : 'Bitcoin verification is retrying automatically.',
-          bitcoinStatus: bitcoinConfirmationLabel(guardianClaim.utxo),
+          kind: !reconstructionComplete
+            ? 'pending'
+            : guardianCount === successfulGuardianCount
+              ? 'verified'
+              : 'mismatch',
+          detail: !reconstructionComplete
+            ? 'Wallet history is still being rebuilt; this result may change.'
+            : guardianCount === successfulGuardianCount
+              ? 'Observer history and all responding guardians agree.'
+            : `Reported by ${guardianCount} of ${successfulGuardianCount} responding guardians.`,
         };
       })
       .sort((left, right) => {
         const kindOrder: Record<UtxoInventoryRow['kind'], number> = {
-          exception: 0,
-          reconciliation: 1,
-          unverified: 2,
-          partial: 3,
-          matched: 4,
+          mismatch: 0,
+          pending: 1,
+          verified: 2,
         };
         return kindOrder[left.kind] - kindOrder[right.kind] || right.amount - left.amount;
       });
-  }, [guardianUtxoClaims, integrityDisagreementsByOutpoint, observerOnlyOutpoints, successfulGuardianCount, utxos, reconstructionComplete]);
+  }, [guardianUtxoClaims, integrityDisagreementsByOutpoint, successfulGuardianCount, utxos, reconstructionComplete]);
 
   const utxoCounts = useMemo(() => ({
     all: utxoInventory.length,
-    matched: utxoInventory.filter((utxo) => utxo.kind === 'matched').length,
-    partial: utxoInventory.filter((utxo) => utxo.kind === 'partial').length,
-    reconciliation: utxoInventory.filter((utxo) => utxo.kind === 'reconciliation').length,
-    exception: utxoInventory.filter((utxo) => utxo.kind === 'exception').length,
-    unverified: utxoInventory.filter((utxo) => utxo.kind === 'unverified').length,
+    verified: utxoInventory.filter((utxo) => utxo.kind === 'verified').length,
+    pending: utxoInventory.filter((utxo) => utxo.kind === 'pending').length,
+    mismatch: utxoInventory.filter((utxo) => utxo.kind === 'mismatch').length,
   }), [utxoInventory]);
 
   const filteredUtxos = useMemo(
@@ -873,7 +845,7 @@ export function FederationDetail() {
             <>
               <Alert
                 level="info"
-                message="This view compares observer history, guardian wallet data, and Bitcoin. Some rows may need review while data is still catching up."
+                message="This view compares reconstructed observer history with guardian wallet data. Results may change while history is catching up."
               />
 
               <section className="mt-5 overflow-hidden border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
@@ -896,14 +868,12 @@ export function FederationDetail() {
                 )}
 
                 {!reconstructionComplete && <div className="px-4 py-3 text-sm text-amber-700 dark:text-amber-300">Wallet history is still being rebuilt. Results may change as replay finishes.</div>}
-                <div className="grid grid-cols-2 border-b border-gray-200 dark:border-gray-700 md:grid-cols-6">
+                <div className="grid grid-cols-2 border-b border-gray-200 dark:border-gray-700 md:grid-cols-4">
                   {([
                     ['all', 'All', 'text-gray-900 dark:text-white'],
-                    ['matched', 'Matched', 'text-emerald-700 dark:text-emerald-300'],
-                    ['partial', 'Partial', 'text-sky-700 dark:text-sky-300'],
-                    ['reconciliation', 'Needs review', 'text-amber-700 dark:text-amber-300'],
-                    ['exception', 'Mismatch', 'text-rose-700 dark:text-rose-300'],
-                    ['unverified', 'Not verified', 'text-gray-700 dark:text-gray-300'],
+                    ['verified', 'Verified', 'text-emerald-700 dark:text-emerald-300'],
+                    ['pending', 'Pending', 'text-amber-700 dark:text-amber-300'],
+                    ['mismatch', 'Mismatch', 'text-rose-700 dark:text-rose-300'],
                   ] as const).map(([view, label, color]) => (
                     <button
                       key={view}
@@ -958,13 +928,12 @@ export function FederationDetail() {
                             </a>
                           )}
                           {utxo.detail && <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{utxo.detail}</p>}
-                          {utxo.bitcoinStatus && <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{utxo.bitcoinStatus}</p>}
                         </div>
                         <div className="hidden whitespace-nowrap text-xs text-gray-600 dark:text-gray-300 sm:block">
-                          {utxo.guardianCount} / {guardianUtxoClaims.length}
+                          {utxo.guardianCount} / {successfulGuardianCount}
                         </div>
-                        <div className={`hidden whitespace-nowrap text-xs font-medium sm:block ${utxo.kind === 'matched' ? 'text-emerald-700 dark:text-emerald-300' : utxo.kind === 'partial' ? 'text-sky-700 dark:text-sky-300' : utxo.kind === 'reconciliation' ? 'text-amber-700 dark:text-amber-300' : utxo.kind === 'unverified' ? 'text-gray-700 dark:text-gray-300' : 'text-rose-700 dark:text-rose-300'}`}>
-                          {utxo.kind === 'matched' ? 'Matched' : utxo.kind === 'partial' ? 'Partial' : utxo.kind === 'reconciliation' ? 'Needs review' : utxo.kind === 'unverified' ? 'Not verified' : 'Mismatch'}
+                        <div className={`hidden whitespace-nowrap text-xs font-medium sm:block ${utxo.kind === 'verified' ? 'text-emerald-700 dark:text-emerald-300' : utxo.kind === 'pending' ? 'text-amber-700 dark:text-amber-300' : 'text-rose-700 dark:text-rose-300'}`}>
+                          {utxo.kind === 'verified' ? 'Verified' : utxo.kind === 'pending' ? 'Pending' : 'Mismatch'}
                         </div>
                         <div className="whitespace-nowrap text-right font-mono text-xs text-gray-900 dark:text-white">
                           {formatMsatsAsBtc(utxo.amount)}
@@ -1013,25 +982,6 @@ function mempoolTxUrl(outPoint: string): string {
 
 function mempoolAddressUrl(address: string): string {
   return `https://mempool.space/address/${address}`;
-}
-
-const BITCOIN_VERIFICATION_QUEUED = 'Bitcoin verification is queued.';
-
-function bitcoinConfirmationLabel(utxo?: Pick<GuardianClaimedUtxo, 'onchain' | 'resolution_error'>): string | undefined {
-  if (!utxo?.onchain) {
-    if (!utxo?.resolution_error) {
-      return undefined;
-    }
-    return utxo.resolution_error === BITCOIN_VERIFICATION_QUEUED
-      ? 'Bitcoin verification is queued.'
-      : `Bitcoin verification is retrying: ${utxo.resolution_error}`;
-  }
-
-  if (!utxo.onchain.confirmed) {
-    return utxo.onchain.spent ? 'Spent · unconfirmed transaction' : 'Unspent · unconfirmed transaction';
-  }
-
-  return `${utxo.onchain.spent ? 'Spent' : 'Unspent'} · ${utxo.onchain.block_height ? `confirmed at block ${utxo.onchain.block_height}` : 'confirmed on Bitcoin'}`;
 }
 
 async function fetchFederationConfig(federationId: string, inviteCode: string): Promise<FederationConfig> {

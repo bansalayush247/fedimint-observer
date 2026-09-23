@@ -156,14 +156,10 @@ async fn get_federation_utxos(
     if !reconstruction_complete {
         observed.clear();
     }
-    let mut guardian_claims = state
+    let guardian_claims = state
         .federation_observer
         .guardian_utxo_claims(federation_id)
         .await?;
-    state
-        .federation_observer
-        .enrich_utxos_onchain(&mut observed, &mut guardian_claims)
-        .await;
     let disagreements = if reconstruction_complete {
         guardian_utxo_disagreements(&observed, &guardian_claims)
     } else {
@@ -197,24 +193,6 @@ fn guardian_utxo_disagreements(
         .collect::<Vec<_>>();
 
     let mut disagreements = Vec::new();
-    for utxo in observed {
-        if let Some(onchain) = &utxo.onchain {
-            let address = utxo.address.clone().assume_checked().to_string();
-            if onchain.amount != utxo.amount
-                || onchain
-                    .address
-                    .as_ref()
-                    .is_some_and(|resolved| *resolved != address)
-            {
-                disagreements.push(GuardianUtxoDisagreement {
-                    out_point: utxo.out_point,
-                    kind: GuardianUtxoDisagreementKind::EvidenceMismatch,
-                    description: "Observer amount or address differs from the Bitcoin output"
-                        .to_owned(),
-                });
-            }
-        }
-    }
     if successful_claims.is_empty() {
         return disagreements;
     }
@@ -235,27 +213,6 @@ fn guardian_utxo_disagreements(
                 acc
             },
         );
-
-    for claim in &successful_claims {
-        for utxo in &claim.utxos {
-            if !is_observer_utxo_claim(utxo) {
-                continue;
-            }
-
-            if let Some(onchain) = &utxo.onchain {
-                if onchain.amount != utxo.amount {
-                    disagreements.push(GuardianUtxoDisagreement {
-                        kind: GuardianUtxoDisagreementKind::EvidenceMismatch,
-                        out_point: utxo.out_point,
-                        description: format!(
-                            "guardian {} reports {} msat, but Bitcoin output has {} msat",
-                            claim.guardian_id, utxo.amount.msats, onchain.amount.msats
-                        ),
-                    });
-                }
-            }
-        }
-    }
 
     for observed_utxo in observed {
         let Some(claims) = claimed_by_outpoint.get(&observed_utxo.out_point) else {
@@ -283,31 +240,6 @@ fn guardian_utxo_disagreements(
                     "observer reports {} msat, but {}",
                     observed_utxo.amount.msats,
                     mismatched_guardians.join(", ")
-                ),
-            });
-        }
-
-        let observed_address = observed_utxo.address.clone().assume_checked().to_string();
-        let mismatched_addresses = claims
-            .iter()
-            .filter_map(|(guardian_id, claim)| {
-                claim
-                    .onchain
-                    .as_ref()
-                    .and_then(|onchain| onchain.address.as_ref())
-                    .filter(|address| *address != &observed_address)
-                    .map(|address| format!("guardian {guardian_id} resolves to address {address}"))
-            })
-            .collect::<Vec<_>>();
-
-        if !mismatched_addresses.is_empty() {
-            disagreements.push(GuardianUtxoDisagreement {
-                kind: GuardianUtxoDisagreementKind::EvidenceMismatch,
-                out_point: observed_utxo.out_point,
-                description: format!(
-                    "observer reconstructs address {}, but {}",
-                    observed_address,
-                    mismatched_addresses.join(", ")
                 ),
             });
         }
@@ -374,7 +306,6 @@ async fn get_federation_totals(
 #[cfg(test)]
 mod utxo_tests {
     use fedimint_core::Amount;
-    use fmo_api_types::GuardianClaimedUtxoOnchain;
 
     use super::*;
 
@@ -385,8 +316,6 @@ mod utxo_tests {
                 .as_unchecked()
                 .clone(),
             amount: Amount::from_sats(100),
-            onchain: None,
-            resolution_error: None,
         }
     }
 
@@ -399,15 +328,8 @@ mod utxo_tests {
                 out_point: OutPoint::null(),
                 amount: Amount::from_sats(100),
                 state: GuardianClaimedUtxoState::Spendable,
-                onchain: None,
-                resolution_error: Some("Explorer timed out".to_owned()),
             }],
         }
-    }
-
-    #[test]
-    fn lookup_failure_is_not_an_evidence_mismatch() {
-        assert!(guardian_utxo_disagreements(&[observed()], &[claim(0)]).is_empty());
     }
 
     #[test]
@@ -440,6 +362,23 @@ mod utxo_tests {
     }
 
     #[test]
+    fn unavailable_guardian_does_not_create_a_false_disagreement() {
+        let unavailable = GuardianUtxoClaim {
+            guardian_id: 1,
+            status: GuardianUtxoClaimStatus::Unavailable,
+            utxos: Vec::new(),
+            error: Some("Guardian does not expose wallet summary".to_owned()),
+        };
+
+        assert!(guardian_utxo_disagreements(&[observed()], &[claim(0), unavailable]).is_empty());
+    }
+
+    #[test]
+    fn matching_guardian_claims_do_not_create_a_disagreement() {
+        assert!(guardian_utxo_disagreements(&[observed()], &[claim(0), claim(1)]).is_empty());
+    }
+
+    #[test]
     fn guardian_amount_conflict_is_detected_without_observer_history() {
         let mut conflicting = claim(1);
         conflicting.utxos[0].amount = Amount::from_sats(999);
@@ -447,25 +386,6 @@ mod utxo_tests {
         assert!(differences
             .iter()
             .any(|difference| difference.kind == GuardianUtxoDisagreementKind::EvidenceMismatch));
-    }
-
-    #[test]
-    fn observer_amount_is_checked_without_guardians() {
-        let mut utxo = observed();
-        utxo.onchain = Some(GuardianClaimedUtxoOnchain {
-            script_pubkey: String::new(),
-            address: None,
-            amount: Amount::from_sats(1),
-            confirmed: true,
-            spent: false,
-            block_height: Some(1),
-        });
-        let differences = guardian_utxo_disagreements(&[utxo], &[]);
-        assert_eq!(differences.len(), 1);
-        assert_eq!(
-            differences[0].kind,
-            GuardianUtxoDisagreementKind::EvidenceMismatch
-        );
     }
 }
 

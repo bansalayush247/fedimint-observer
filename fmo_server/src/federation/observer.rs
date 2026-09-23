@@ -1,11 +1,8 @@
-use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, ensure, Context};
 use bitcoin::hashes::Hash;
-use bitcoin::hex::DisplayHex as _;
 use bitcoin::{Address, OutPoint, Txid};
 use chrono::{DateTime, NaiveDate};
 use deadpool_postgres::{GenericClient, Runtime, Transaction};
@@ -33,8 +30,8 @@ use fedimint_wallet_common::{
 };
 use fmo_api_types::{
     FederationActivity, FederationHealth, FederationSummary, FederationUtxo, FedimintTotals,
-    GuardianClaimedUtxo, GuardianClaimedUtxoOnchain, GuardianClaimedUtxoState, GuardianUtxoClaim,
-    GuardianUtxoClaimStatus, NonceSpendInfo,
+    GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus,
+    NonceSpendInfo,
 };
 use futures::future::join_all;
 use futures::StreamExt;
@@ -61,7 +58,6 @@ pub struct FederationObserver {
     task_group: TaskGroup,
     consensus_meta_cache: ConsensusMetaCache,
     connectors: ConnectorRegistry,
-    bitcoin_requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl FederationObserver {
@@ -87,7 +83,6 @@ impl FederationObserver {
             task_group: Default::default(),
             consensus_meta_cache: Default::default(),
             connectors,
-            bitcoin_requests: Arc::new(tokio::sync::Semaphore::new(16)),
         };
 
         slf.setup_schema().await?;
@@ -102,11 +97,6 @@ impl FederationObserver {
             .spawn_cancellable("sync nostr events", Self::sync_nostr_events(slf.clone()));
         slf.task_group
             .spawn_cancellable("refresh views", Self::refresh_views(slf.clone()));
-        slf.task_group.spawn_cancellable(
-            "refresh Bitcoin UTXO verification cache",
-            Self::refresh_bitcoin_verification_cache(slf.clone()),
-        );
-
         Ok(slf)
     }
 
@@ -1501,8 +1491,6 @@ impl FederationObserver {
                     vout: utxo.on_chain_vout.try_into()?,
                 },
                 amount: Amount::from_msats(utxo.amount_msat.try_into()?),
-                onchain: None,
-                resolution_error: None,
             })
         }).collect()
     }
@@ -1585,448 +1573,6 @@ impl FederationObserver {
         .await;
 
         Ok(claims)
-    }
-
-    pub async fn enrich_utxos_onchain(
-        &self,
-        observed: &mut [FederationUtxo],
-        guardian_claims: &mut [GuardianUtxoClaim],
-    ) {
-        let outpoints = guardian_claims
-            .iter()
-            .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Ok))
-            .flat_map(|claim| {
-                claim
-                    .utxos
-                    .iter()
-                    .filter(|utxo| utxo.state != GuardianClaimedUtxoState::UnsignedChange)
-                    .map(|utxo| utxo.out_point)
-            })
-            .chain(observed.iter().map(|utxo| utxo.out_point))
-            .collect::<HashSet<_>>();
-
-        if outpoints.is_empty() {
-            return;
-        }
-
-        if let Err(error) = self.enqueue_onchain_verifications(&outpoints).await {
-            warn!(%error, "Could not queue Bitcoin UTXO verification");
-        }
-        let resolutions = match self.cached_onchain_resolutions(&outpoints).await {
-            Ok(resolutions) => resolutions,
-            Err(error) => {
-                warn!(%error, "Could not read Bitcoin UTXO verification cache");
-                HashMap::new()
-            }
-        };
-        for utxo in observed {
-            apply_cached_onchain_resolution(
-                &mut utxo.onchain,
-                &mut utxo.resolution_error,
-                resolutions.get(&utxo.out_point),
-            );
-        }
-        for claim in guardian_claims {
-            for utxo in &mut claim.utxos {
-                if utxo.state != GuardianClaimedUtxoState::UnsignedChange {
-                    apply_cached_onchain_resolution(
-                        &mut utxo.onchain,
-                        &mut utxo.resolution_error,
-                        resolutions.get(&utxo.out_point),
-                    );
-                }
-            }
-        }
-    }
-
-    async fn enqueue_onchain_verifications(
-        &self,
-        outpoints: &HashSet<OutPoint>,
-    ) -> anyhow::Result<()> {
-        let txids = outpoints
-            .iter()
-            .map(|outpoint| outpoint.txid.to_byte_array().to_vec())
-            .collect::<Vec<_>>();
-        let vouts = outpoints
-            .iter()
-            .map(|outpoint| i32::try_from(outpoint.vout))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        execute(
-            &self.connection().await?,
-            "
-            INSERT INTO bitcoin_outpoint_verifications (txid, vout)
-            SELECT * FROM UNNEST($1::bytea[], $2::integer[])
-            ON CONFLICT (txid, vout) DO UPDATE
-            SET last_seen_at = EXCLUDED.last_seen_at
-            ",
-            &[&txids, &vouts],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn cached_onchain_resolutions(
-        &self,
-        outpoints: &HashSet<OutPoint>,
-    ) -> anyhow::Result<HashMap<OutPoint, Result<GuardianClaimedUtxoOnchain, String>>> {
-        let txids = outpoints
-            .iter()
-            .map(|outpoint| outpoint.txid.to_byte_array().to_vec())
-            .collect::<Vec<_>>();
-        let rows = self
-            .connection()
-            .await?
-            .query(
-                "
-                SELECT txid, vout, script_pubkey, address, amount_msat, confirmed, spent,
-                       block_height, last_error
-                FROM bitcoin_outpoint_verifications
-                WHERE txid = ANY($1::bytea[])
-                ",
-                &[&txids],
-            )
-            .await?;
-
-        let mut resolutions = HashMap::new();
-        for row in rows {
-            let txid_bytes: Vec<u8> = row.try_get("txid")?;
-            let vout: i32 = row.try_get("vout")?;
-            let outpoint = OutPoint {
-                txid: Txid::from_slice(&txid_bytes)?,
-                vout: vout.try_into()?,
-            };
-            if !outpoints.contains(&outpoint) {
-                continue;
-            }
-
-            let script_pubkey: Option<String> = row.try_get("script_pubkey")?;
-            let amount_msat: Option<i64> = row.try_get("amount_msat")?;
-            let confirmed: Option<bool> = row.try_get("confirmed")?;
-            let spent: Option<bool> = row.try_get("spent")?;
-            if let (Some(script_pubkey), Some(amount_msat), Some(confirmed), Some(spent)) =
-                (script_pubkey, amount_msat, confirmed, spent)
-            {
-                let address: Option<String> = row.try_get("address")?;
-                let block_height: Option<i32> = row.try_get("block_height")?;
-                resolutions.insert(
-                    outpoint,
-                    Ok(GuardianClaimedUtxoOnchain {
-                        script_pubkey,
-                        address,
-                        amount: Amount::from_msats(amount_msat.try_into()?),
-                        confirmed,
-                        spent,
-                        block_height: block_height.map(u32::try_from).transpose()?,
-                    }),
-                );
-            } else if let Some(error) = row.try_get::<_, Option<String>>("last_error")? {
-                resolutions.insert(outpoint, Err(error));
-            }
-        }
-        Ok(resolutions)
-    }
-
-    async fn refresh_bitcoin_verification_cache(self) {
-        let mut next_inventory_refresh = tokio::time::Instant::now();
-        let mut next_prune = tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24);
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= next_inventory_refresh {
-                if let Err(error) = self.enqueue_observed_utxo_verifications().await {
-                    warn!(%error, "Could not queue reconstructed UTXOs for Bitcoin verification");
-                }
-                next_inventory_refresh = now + Duration::from_secs(60);
-            }
-            if now >= next_prune {
-                if let Err(error) = self.prune_stale_onchain_verifications().await {
-                    warn!(%error, "Could not prune stale Bitcoin UTXO verification cache entries");
-                }
-                next_prune = now + Duration::from_secs(60 * 60 * 24);
-            }
-
-            let outpoints = match self.claim_due_onchain_verifications().await {
-                Ok(outpoints) => outpoints,
-                Err(error) => {
-                    warn!(%error, "Could not claim Bitcoin UTXO verification work");
-                    sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-            if outpoints.is_empty() {
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-
-            let resolutions = self.resolve_onchain_outpoints(outpoints).await;
-            if let Err(error) = self.store_onchain_resolutions(resolutions).await {
-                warn!(%error, "Could not persist Bitcoin UTXO verification results");
-            }
-        }
-    }
-
-    async fn enqueue_observed_utxo_verifications(&self) -> anyhow::Result<()> {
-        execute(
-            &self.connection().await?,
-            "
-            INSERT INTO bitcoin_outpoint_verifications (txid, vout)
-            SELECT on_chain_txid, on_chain_vout FROM utxos
-            ON CONFLICT (txid, vout) DO UPDATE
-            SET last_seen_at = EXCLUDED.last_seen_at
-            ",
-            &[],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn prune_stale_onchain_verifications(&self) -> anyhow::Result<()> {
-        // Delete in bounded batches so cache maintenance never holds a broad
-        // lock on a large installation.
-        execute(
-            &self.connection().await?,
-            "
-            DELETE FROM bitcoin_outpoint_verifications
-            WHERE ctid IN (
-                SELECT ctid
-                FROM bitcoin_outpoint_verifications
-                WHERE last_seen_at < NOW() - INTERVAL '90 days'
-                LIMIT 1000
-            )
-            ",
-            &[],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn claim_due_onchain_verifications(&self) -> anyhow::Result<HashSet<OutPoint>> {
-        let rows = self
-            .connection()
-            .await?
-            .query(
-                "
-                WITH due AS (
-                    SELECT txid, vout
-                    FROM bitcoin_outpoint_verifications
-                    WHERE next_retry_at <= NOW()
-                      AND last_seen_at >= NOW() - INTERVAL '30 days'
-                    ORDER BY next_retry_at
-                    LIMIT 32
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE bitcoin_outpoint_verifications AS cache
-                SET next_retry_at = NOW() + INTERVAL '2 minutes'
-                FROM due
-                WHERE cache.txid = due.txid AND cache.vout = due.vout
-                RETURNING cache.txid, cache.vout
-                ",
-                &[],
-            )
-            .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(OutPoint {
-                    txid: Txid::from_slice(&row.try_get::<_, Vec<u8>>("txid")?)?,
-                    vout: row.try_get::<_, i32>("vout")?.try_into()?,
-                })
-            })
-            .collect()
-    }
-
-    async fn store_onchain_resolutions(
-        &self,
-        resolutions: HashMap<OutPoint, Result<GuardianClaimedUtxoOnchain, String>>,
-    ) -> anyhow::Result<()> {
-        let mut connection = self.connection().await?;
-        let dbtx = connection.transaction().await?;
-        for (outpoint, resolution) in resolutions {
-            let txid = outpoint.txid.to_byte_array().to_vec();
-            let vout = i32::try_from(outpoint.vout)?;
-            match resolution {
-                Ok(onchain) => {
-                    let amount_msat = i64::try_from(onchain.amount.msats)?;
-                    let block_height = onchain.block_height.map(i32::try_from).transpose()?;
-                    let refresh_after_seconds = if onchain.spent { 3600_i64 } else { 900_i64 };
-                    dbtx.execute(
-                        "
-                        UPDATE bitcoin_outpoint_verifications
-                        SET script_pubkey = $3, address = $4, amount_msat = $5,
-                            confirmed = $6, spent = $7, block_height = $8,
-                            last_error = NULL, checked_at = NOW(),
-                            next_retry_at = NOW() + ($9 * INTERVAL '1 second'),
-                            failure_count = 0
-                        WHERE txid = $1 AND vout = $2
-                        ",
-                        &[
-                            &txid,
-                            &vout,
-                            &onchain.script_pubkey,
-                            &onchain.address,
-                            &amount_msat,
-                            &onchain.confirmed,
-                            &onchain.spent,
-                            &block_height,
-                            &refresh_after_seconds,
-                        ],
-                    )
-                    .await?;
-                }
-                Err(error) => {
-                    dbtx.execute(
-                        "
-                        UPDATE bitcoin_outpoint_verifications
-                        SET last_error = $3, checked_at = NOW(),
-                            next_retry_at = NOW() + (
-                                LEAST(3600, 30 * POWER(2, LEAST(failure_count, 6)))
-                                * INTERVAL '1 second'
-                            ),
-                            failure_count = LEAST(failure_count + 1, 7)
-                        WHERE txid = $1 AND vout = $2
-                        ",
-                        &[&txid, &vout, &error],
-                    )
-                    .await?;
-                }
-            }
-        }
-        dbtx.commit().await?;
-        Ok(())
-    }
-
-    async fn resolve_onchain_outpoints(
-        &self,
-        outpoints: HashSet<OutPoint>,
-    ) -> HashMap<OutPoint, Result<GuardianClaimedUtxoOnchain, String>> {
-        let mut outpoints_by_txid = HashMap::<Txid, Vec<OutPoint>>::new();
-        for outpoint in outpoints {
-            outpoints_by_txid
-                .entry(outpoint.txid)
-                .or_default()
-                .push(outpoint);
-        }
-
-        let client = match esplora_client::Builder::new(&self.mempool_url)
-            .timeout(5)
-            .build_async()
-        {
-            Ok(client) => client,
-            Err(error) => {
-                return outpoints_by_txid
-                    .into_values()
-                    .flatten()
-                    .map(|outpoint| {
-                        (
-                            outpoint,
-                            Err(format!("failed to create Esplora client: {error}")),
-                        )
-                    })
-                    .collect();
-            }
-        };
-
-        let resolutions = futures::stream::iter(outpoints_by_txid)
-            .map(|(txid, outpoints)| {
-                let client = client.clone();
-                async move {
-                    let _permit = self
-                        .bitcoin_requests
-                        .acquire()
-                        .await
-                        .expect("Bitcoin request semaphore remains open");
-                    let tx = match client.get_tx_no_opt(&txid).await {
-                        Ok(tx) => tx,
-                        Err(error) => {
-                            return outpoints
-                                .into_iter()
-                                .map(|outpoint| {
-                                    (
-                                        outpoint,
-                                        Err(format!("failed to fetch transaction: {error}")),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                        }
-                    };
-
-                    let status = match client.get_tx_status(&txid).await {
-                        Ok(status) => status,
-                        Err(error) => {
-                            return outpoints
-                                .into_iter()
-                                .map(|outpoint| {
-                                    (
-                                        outpoint,
-                                        Err(format!("failed to fetch transaction status: {error}")),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                        }
-                    };
-
-                    let mut results = Vec::with_capacity(outpoints.len());
-                    for outpoint in outpoints {
-                        let spent = match client
-                            .get_output_status(&txid, u64::from(outpoint.vout))
-                            .await
-                        {
-                            Ok(Some(status)) => status.spent,
-                            Ok(None) => {
-                                results.push((
-                                    outpoint,
-                                    Err("Output spend status unavailable".to_owned()),
-                                ));
-                                continue;
-                            }
-                            Err(error) => {
-                                results.push((
-                                    outpoint,
-                                    Err(format!("Output spend status unavailable: {error}")),
-                                ));
-                                continue;
-                            }
-                        };
-                        let result = tx
-                            .output
-                            .get(outpoint.vout as usize)
-                            .ok_or_else(|| {
-                                format!("transaction does not have vout {}", outpoint.vout)
-                            })
-                            .map(|output| {
-                                let address = Address::from_script(
-                                    &output.script_pubkey,
-                                    bitcoin::Network::Bitcoin,
-                                )
-                                .ok()
-                                .map(|address| address.to_string());
-
-                                GuardianClaimedUtxoOnchain {
-                                    script_pubkey: output
-                                        .script_pubkey
-                                        .as_bytes()
-                                        .as_hex()
-                                        .to_string(),
-                                    address,
-                                    amount: Amount::from_sats(output.value.to_sat()),
-                                    confirmed: status.confirmed,
-                                    spent,
-                                    block_height: status.block_height,
-                                }
-                            });
-
-                        results.push((outpoint, result));
-                    }
-                    results
-                }
-            })
-            .buffer_unordered(16);
-        tokio::pin!(resolutions);
-        let mut completed = HashMap::new();
-        while let Some(batch) = resolutions.next().await {
-            completed.extend(batch);
-        }
-        completed
     }
 
     pub async fn totals(&self) -> anyhow::Result<FedimintTotals> {
@@ -2256,27 +1802,6 @@ fn wallet_summary_claimed_utxos(summary: WalletSummary) -> Vec<GuardianClaimedUt
     utxos
 }
 
-fn apply_cached_onchain_resolution(
-    onchain: &mut Option<GuardianClaimedUtxoOnchain>,
-    resolution_error: &mut Option<String>,
-    resolution: Option<&Result<GuardianClaimedUtxoOnchain, String>>,
-) {
-    match resolution {
-        Some(Ok(resolved)) => {
-            *onchain = Some(resolved.clone());
-            *resolution_error = None;
-        }
-        Some(Err(error)) => {
-            *onchain = None;
-            *resolution_error = Some(error.clone());
-        }
-        None => {
-            *onchain = None;
-            *resolution_error = Some("Bitcoin verification is queued.".to_owned());
-        }
-    }
-}
-
 fn append_claimed_utxos(
     utxos: &mut Vec<GuardianClaimedUtxo>,
     txos: Vec<TxOutputSummary>,
@@ -2286,8 +1811,6 @@ fn append_claimed_utxos(
         out_point: txo.outpoint,
         amount: Amount::from_sats(txo.amount.to_sat()),
         state,
-        onchain: None,
-        resolution_error: None,
     }));
 }
 

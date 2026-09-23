@@ -39,10 +39,6 @@ pub struct FederationUtxo {
     pub address: bitcoin::Address<NetworkUnchecked>,
     pub out_point: bitcoin::OutPoint,
     pub amount: Amount,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub onchain: Option<GuardianClaimedUtxoOnchain>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolution_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,20 +70,6 @@ pub struct GuardianClaimedUtxo {
     pub out_point: bitcoin::OutPoint,
     pub amount: Amount,
     pub state: GuardianClaimedUtxoState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub onchain: Option<GuardianClaimedUtxoOnchain>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolution_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuardianClaimedUtxoOnchain {
-    pub script_pubkey: String,
-    pub address: Option<String>,
-    pub amount: Amount,
-    pub confirmed: bool,
-    pub spent: bool,
-    pub block_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
