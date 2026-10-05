@@ -14,6 +14,7 @@ import { Alert } from '../components/Alert';
 import { Copyable } from '../components/Copyable';
 
 const MSATS_PER_BTC = 100_000_000_000;
+const UTXOS_PER_PAGE = 25;
 
 type UtxoView = 'all' | 'verified' | 'pending' | 'mismatch';
 
@@ -24,6 +25,16 @@ interface UtxoInventoryRow {
   guardianCount: number;
   kind: Exclude<UtxoView, 'all'>;
   detail?: string;
+}
+
+// Page numbers to show around the current page, with gaps for skipped ranges
+function utxoPageItems(current: number, total: number): (number | 'gap')[] {
+  const pages = [...new Set([1, current - 1, current, current + 1, total])]
+    .filter((page) => page >= 1 && page <= total)
+    .sort((left, right) => left - right);
+  return pages.flatMap((page, index) =>
+    index > 0 && page - pages[index - 1] > 1 ? (['gap', page] as const) : [page]
+  );
 }
 
 // Lazy load the chart component for code splitting
@@ -75,7 +86,6 @@ export function FederationDetail() {
   const [federation, setFederation] = useState<FederationSummary | null>(null);
   const [config, setConfig] = useState<FederationConfig | null>(null);
   const [utxos, setUtxos] = useState<FederationUtxo[]>([]);
-  const [reconstructionComplete, setReconstructionComplete] = useState(false);
   const [guardianUtxoClaims, setGuardianUtxoClaims] = useState<GuardianUtxoClaim[]>([]);
   const [utxoDisagreements, setUtxoDisagreements] = useState<GuardianUtxoDisagreement[]>([]);
   const [loading, setLoading] = useState(true);
@@ -83,7 +93,8 @@ export function FederationDetail() {
   const [activeTab, setActiveTab] = useState<'activity' | 'utxos' | 'config'>('activity');
   const [utxosLoading, setUtxosLoading] = useState(false);
   const [utxoView, setUtxoView] = useState<UtxoView>('all');
-  const [utxoLimit, setUtxoLimit] = useState(25);
+  const [utxoPage, setUtxoPage] = useState(1);
+  const [utxoSearch, setUtxoSearch] = useState('');
   const [rating, setRating] = useState(5);
   const [comment, setComment] = useState('');
   const [ratingError, setRatingError] = useState<string | null>(null);
@@ -103,13 +114,10 @@ export function FederationDetail() {
     );
   }, [guardianHealth]);
 
-  const integrityDisagreementsByOutpoint = useMemo(() => {
-    return new Map(
-      utxoDisagreements
-        .filter((disagreement) => disagreement.kind === 'evidence_mismatch')
-        .map((disagreement) => [disagreement.out_point, disagreement.description])
-    );
-  }, [utxoDisagreements]);
+  const disagreementsByOutpoint = useMemo(
+    () => new Map(utxoDisagreements.map((disagreement) => [disagreement.out_point, disagreement])),
+    [utxoDisagreements]
+  );
 
   const successfulGuardianCount = useMemo(
     () => guardianUtxoClaims.filter((claim) => claim.status === 'ok').length,
@@ -140,77 +148,49 @@ export function FederationDetail() {
     const outpoints = new Set([
       ...observedByOutpoint.keys(),
       ...guardianClaimsByOutpoint.keys(),
-      ...integrityDisagreementsByOutpoint.keys(),
+      ...disagreementsByOutpoint.keys(),
     ]);
 
     return [...outpoints]
       .map((outPoint): UtxoInventoryRow => {
         const observed = observedByOutpoint.get(outPoint);
         const guardianClaim = guardianClaimsByOutpoint.get(outPoint);
-        const integrityDetail = integrityDisagreementsByOutpoint.get(outPoint);
-        const guardianCount = guardianClaim?.guardianIds.size ?? 0;
+        const disagreement = disagreementsByOutpoint.get(outPoint);
+        const row = {
+          outPoint,
+          amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
+          address: observed?.address ?? null,
+          guardianCount: guardianClaim?.guardianIds.size ?? 0,
+        };
+
+        // The backend reports every difference between the observer and the
+        // responding guardians; observer-side ones are usually lag, not fraud.
+        if (disagreement) {
+          return {
+            ...row,
+            kind: disagreement.kind === 'observer_difference' ? 'pending' : 'mismatch',
+            detail: disagreement.description,
+          };
+        }
+
         const pendingStates = [...(guardianClaim?.states ?? [])].filter((state) => state !== 'spendable');
-        if (!integrityDetail && pendingStates.length > 0) {
+        if (pendingStates.length > 0) {
           return {
-            outPoint, amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
-            address: observed?.address ?? null,
-            guardianCount, kind: 'pending',
-            detail: !reconstructionComplete ? 'Wallet history is still being rebuilt.' : `This output is still pending: ${pendingStates.map((state) => state.replaceAll('_', ' ')).join(', ')}.`,
-          };
-        }
-
-        if (integrityDetail) {
-          return {
-            outPoint,
-            amount: observed?.amount ?? guardianClaim?.utxo.amount ?? 0,
-            address: observed?.address ?? null,
-            guardianCount,
-            kind: 'mismatch',
-            detail: integrityDetail,
-          };
-        }
-
-        if (!observed && guardianClaim) {
-          return {
-            outPoint,
-            amount: guardianClaim.utxo.amount,
-            address: null,
-            guardianCount,
+            ...row,
             kind: 'pending',
-            detail: 'Only guardians reported this. Observer history has not confirmed it yet.',
+            detail: `This output is still pending: ${pendingStates.map((state) => state.replaceAll('_', ' ')).join(', ')}.`,
           };
         }
 
         if (!guardianClaim) {
-          const pending = successfulGuardianCount === 0 || !reconstructionComplete;
-          return {
-            outPoint,
-            amount: observed?.amount ?? 0,
-            address: observed?.address ?? null,
-            guardianCount,
-            kind: pending ? 'pending' : 'mismatch',
-            detail: pending
-              ? 'Waiting for guardian wallet data.'
-              : 'Found in observer history, but not reported by any responding guardian.',
-          };
+          return { ...row, kind: 'pending', detail: 'Waiting for guardian wallet data.' };
         }
 
-        return {
-          outPoint,
-          amount: observed?.amount ?? guardianClaim.utxo.amount,
-          address: observed?.address ?? null,
-          guardianCount,
-          kind: !reconstructionComplete
-            ? 'pending'
-            : guardianCount === successfulGuardianCount
-              ? 'verified'
-              : 'mismatch',
-          detail: !reconstructionComplete
-            ? 'Wallet history is still being rebuilt; this result may change.'
-            : guardianCount === successfulGuardianCount
-              ? 'Observer history and all responding guardians agree.'
-            : `Reported by ${guardianCount} of ${successfulGuardianCount} responding guardians.`,
-        };
+        if (!observed) {
+          return { ...row, kind: 'pending', detail: 'Only guardians reported this. Observer history has not confirmed it yet.' };
+        }
+
+        return { ...row, kind: 'verified', detail: 'Observer history and all responding guardians agree.' };
       })
       .sort((left, right) => {
         const kindOrder: Record<UtxoInventoryRow['kind'], number> = {
@@ -220,7 +200,7 @@ export function FederationDetail() {
         };
         return kindOrder[left.kind] - kindOrder[right.kind] || right.amount - left.amount;
       });
-  }, [guardianUtxoClaims, integrityDisagreementsByOutpoint, successfulGuardianCount, utxos, reconstructionComplete]);
+  }, [guardianUtxoClaims, disagreementsByOutpoint, utxos]);
 
   const utxoCounts = useMemo(() => ({
     all: utxoInventory.length,
@@ -229,17 +209,28 @@ export function FederationDetail() {
     mismatch: utxoInventory.filter((utxo) => utxo.kind === 'mismatch').length,
   }), [utxoInventory]);
 
-  const filteredUtxos = useMemo(
-    () => utxoView === 'all' ? utxoInventory : utxoInventory.filter((utxo) => utxo.kind === utxoView),
-    [utxoInventory, utxoView]
-  );
+  const filteredUtxos = useMemo(() => {
+    const query = utxoSearch.trim().toLowerCase();
+    return utxoInventory.filter((utxo) =>
+      (utxoView === 'all' || utxo.kind === utxoView)
+      && (!query
+        || utxo.outPoint.toLowerCase().includes(query)
+        || (utxo.address?.toLowerCase().includes(query) ?? false)
+        || formatMsatsAsBtc(utxo.amount).includes(query))
+    );
+  }, [utxoInventory, utxoView, utxoSearch]);
 
-  const visibleUtxos = filteredUtxos.slice(0, utxoLimit);
+  const utxoPageCount = Math.max(1, Math.ceil(filteredUtxos.length / UTXOS_PER_PAGE));
+  // Clamped so a refresh that shrinks the list never leaves an empty page
+  const currentUtxoPage = Math.min(utxoPage, utxoPageCount);
+  const utxoPageStart = (currentUtxoPage - 1) * UTXOS_PER_PAGE;
+  const visibleUtxos = filteredUtxos.slice(utxoPageStart, utxoPageStart + UTXOS_PER_PAGE);
   const guardianSummaryUnavailable = guardianUtxoClaims.length > 0 && successfulGuardianCount === 0;
+  const laggingGuardians = guardianUtxoClaims.filter((claim) => claim.status === 'lagging');
 
   useEffect(() => {
-    setUtxoLimit(25);
-  }, [id, utxoView]);
+    setUtxoPage(1);
+  }, [id, utxoView, utxoSearch]);
   
   // Calculate initial zoom to show last 3 months of data by default
   const initialZoom = useMemo(() => {
@@ -400,13 +391,11 @@ export function FederationDetail() {
     try {
       const data = await api.getFederationUtxos(federationId);
       setUtxos(data.observed);
-      setReconstructionComplete(data.reconstruction_complete);
       setGuardianUtxoClaims(data.guardian_claims);
       setUtxoDisagreements(data.disagreements);
     } catch (err) {
       console.error('Failed to fetch UTXOs:', err);
       setUtxos([]);
-      setReconstructionComplete(false);
       setGuardianUtxoClaims([]);
       setUtxoDisagreements([]);
     } finally {
@@ -857,7 +846,7 @@ export function FederationDetail() {
                     </p>
                   </div>
                   <div className="text-xs text-gray-500 dark:text-gray-400">
-                    {successfulGuardianCount} of {guardianUtxoClaims.length} guardian responses available
+                    {successfulGuardianCount} of {guardianUtxoClaims.length} guardians compared
                   </div>
                 </div>
 
@@ -867,7 +856,12 @@ export function FederationDetail() {
                   </div>
                 )}
 
-                {!reconstructionComplete && <div className="px-4 py-3 text-sm text-amber-700 dark:text-amber-300">Wallet history is still being rebuilt. Results may change as replay finishes.</div>}
+                {laggingGuardians.length > 0 && (
+                  <div className="border-b border-gray-200 px-4 py-3 text-xs text-gray-600 dark:border-gray-700 dark:text-gray-300 sm:px-6">
+                    Left out of the comparison because they are behind the federation:{' '}
+                    {laggingGuardians.map((claim) => `guardian ${claim.guardian_id} (session ${claim.session_count})`).join(', ')}.
+                  </div>
+                )}
                 <div className="grid grid-cols-2 border-b border-gray-200 dark:border-gray-700 md:grid-cols-4">
                   {([
                     ['all', 'All', 'text-gray-900 dark:text-white'],
@@ -887,6 +881,22 @@ export function FederationDetail() {
                   ))}
                 </div>
 
+                <div className="flex flex-col gap-2 border-b border-gray-200 px-4 py-3 dark:border-gray-700 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+                  <input
+                    type="search"
+                    value={utxoSearch}
+                    onChange={(event) => setUtxoSearch(event.target.value)}
+                    aria-label="Search UTXOs"
+                    placeholder="Search outpoint, txid, address or amount"
+                    className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-900 dark:text-white sm:max-w-md"
+                  />
+                  <div className="text-xs text-gray-500 dark:text-gray-400">
+                    {filteredUtxos.length === 0
+                      ? '0 UTXOs'
+                      : `Showing ${utxoPageStart + 1}–${utxoPageStart + visibleUtxos.length} of ${filteredUtxos.length} UTXOs`}
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-[minmax(13rem,1fr)_auto] gap-4 border-b border-gray-200 bg-gray-50 px-4 py-2 text-[11px] font-medium uppercase tracking-wide text-gray-500 dark:border-gray-700 dark:bg-gray-900/40 dark:text-gray-400 sm:grid-cols-[minmax(16rem,1fr)_auto_auto_auto] sm:px-6">
                   <div>Outpoint and address</div>
                   <div className="hidden sm:block">Guardian reports</div>
@@ -901,7 +911,7 @@ export function FederationDetail() {
                     </div>
                   ) : filteredUtxos.length === 0 ? (
                     <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
-                      No UTXOs found
+                      {utxoSearch.trim() ? `No UTXOs match "${utxoSearch.trim()}"` : 'No UTXOs found'}
                     </div>
                   ) : (
                     visibleUtxos.map((utxo) => (
@@ -943,16 +953,45 @@ export function FederationDetail() {
                   )}
                 </div>
 
-                {visibleUtxos.length < filteredUtxos.length && (
-                  <div className="border-t border-gray-200 px-4 py-3 dark:border-gray-700 sm:px-6">
+                {utxoPageCount > 1 && (
+                  <nav
+                    aria-label="UTXO pages"
+                    className="flex flex-wrap items-center justify-between gap-2 border-t border-gray-200 px-4 py-3 dark:border-gray-700 sm:px-6"
+                  >
                     <button
                       type="button"
-                      onClick={() => setUtxoLimit((current) => current + 25)}
-                      className="text-xs font-semibold text-blue-700 underline hover:no-underline dark:text-blue-400"
+                      onClick={() => setUtxoPage(currentUtxoPage - 1)}
+                      disabled={currentUtxoPage === 1}
+                      className="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
                     >
-                      Show 25 more UTXOs ({filteredUtxos.length - visibleUtxos.length} remaining)
+                      ← Previous
                     </button>
-                  </div>
+                    <div className="flex flex-wrap items-center gap-1">
+                      {utxoPageItems(currentUtxoPage, utxoPageCount).map((item, index) =>
+                        item === 'gap' ? (
+                          <span key={`gap-${index}`} className="px-1 text-xs text-gray-400">…</span>
+                        ) : (
+                          <button
+                            key={item}
+                            type="button"
+                            onClick={() => setUtxoPage(item)}
+                            aria-current={item === currentUtxoPage ? 'page' : undefined}
+                            className={`min-w-8 rounded-md px-2 py-1.5 text-xs font-medium ${item === currentUtxoPage ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-700'}`}
+                          >
+                            {item}
+                          </button>
+                        )
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setUtxoPage(currentUtxoPage + 1)}
+                      disabled={currentUtxoPage === utxoPageCount}
+                      className="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
+                    >
+                      Next →
+                    </button>
+                  </nav>
                 )}
               </section>
             </>

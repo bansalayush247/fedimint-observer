@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, ensure, Context};
 use bitcoin::hashes::Hash;
@@ -11,6 +13,7 @@ use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::core::DynModuleConsensusItem;
 use fedimint_core::encoding::Encodable;
+use fedimint_core::endpoint_constants::STATUS_ENDPOINT;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::ApiRequestErased;
@@ -50,6 +53,12 @@ use crate::federation::{db, decoders_from_config, instance_to_kind};
 use crate::util::{execute, query, query_one, query_opt, query_value};
 use crate::{migration, migration_backfill, schema_setup};
 
+/// Guardian wallet summaries younger than this are reused, so page views don't
+/// each send a request to every guardian.
+const GUARDIAN_CLAIMS_TTL: Duration = Duration::from_secs(30);
+
+type GuardianClaimsSlot = Arc<tokio::sync::Mutex<Option<(Instant, Vec<GuardianUtxoClaim>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct FederationObserver {
     connection_pool: deadpool_postgres::Pool,
@@ -58,6 +67,7 @@ pub struct FederationObserver {
     task_group: TaskGroup,
     consensus_meta_cache: ConsensusMetaCache,
     connectors: ConnectorRegistry,
+    guardian_claims_cache: Arc<Mutex<HashMap<FederationId, GuardianClaimsSlot>>>,
 }
 
 impl FederationObserver {
@@ -83,6 +93,7 @@ impl FederationObserver {
             task_group: Default::default(),
             consensus_meta_cache: Default::default(),
             connectors,
+            guardian_claims_cache: Default::default(),
         };
 
         slf.setup_schema().await?;
@@ -585,7 +596,6 @@ impl FederationObserver {
         let decoders = decoders_from_config(&config);
 
         info!("Starting background job for {federation_id}");
-        self.rebuild_wallet_history(federation_id, &config).await?;
         let next_session = self.federation_session_count(federation_id).await?;
         debug!("Next session {next_session}");
         let api_fetch = api.clone();
@@ -977,7 +987,7 @@ impl FederationObserver {
                     WalletOutputV0::PegOut(peg_out) => {
                         let withdrawal_address = peg_out.recipient.clone().assume_checked();
                         dbtx.execute(
-                            "INSERT INTO wallet_withdrawal_addresses (address, federation_id, session_index, item_index, txid, out_index, recipient_amount_msat) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (address, txid) DO UPDATE SET recipient_amount_msat = EXCLUDED.recipient_amount_msat",
+                            "INSERT INTO wallet_withdrawal_addresses VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
                             &[
                                 &withdrawal_address.to_string(),
                                 &federation_id.consensus_encode_to_vec(),
@@ -985,7 +995,6 @@ impl FederationObserver {
                                 &(item_index as i32),
                                 &fedimint_txid.consensus_encode_to_vec(),
                                 &(out_idx as i32),
-                                &((peg_out.amount.to_sat() * 1000) as i64),
                             ]
                         ).await?;
                     }
@@ -1248,17 +1257,9 @@ impl FederationObserver {
                     "SELECT EXISTS(SELECT 1 FROM wallet_withdrawal_transaction_outputs WHERE on_chain_txid=$1)",
                     &[&peg_out_txid_encoded],
                 ).await?.get(0);
+                // Every signature after the threshold lands here too; the
+                // transaction only needs fetching once
                 if cached {
-                    dbtx.execute(
-                        include_str!("sql/wallet_recipient.sql"),
-                        &[
-                            &peg_out_txid_encoded,
-                            &federation_id.consensus_encode_to_vec(),
-                            &(session_index as i32),
-                            &(item_index as i32),
-                        ],
-                    )
-                    .await?;
                     return Ok(());
                 }
 
@@ -1316,18 +1317,6 @@ impl FederationObserver {
                     )
                     .await?;
                 }
-                // A reused address alone cannot identify a recipient. Require
-                // one exact request/output match in this federation's history.
-                dbtx.execute(
-                    include_str!("sql/wallet_recipient.sql"),
-                    &[
-                        &peg_out_txid_encoded,
-                        &federation_id.consensus_encode_to_vec(),
-                        &(session_index as i32),
-                        &(item_index as i32),
-                    ],
-                )
-                .await?;
             }
             _ => {
                 // other WalletConsesnsusItems are not needed yet
@@ -1393,83 +1382,10 @@ impl FederationObserver {
         Ok(Amount::from_msats(total_assets_msat as u64))
     }
 
-    /// Replay stored sessions in bounded batches. The checkpoint commits with
-    /// the reconstructed rows, so interruption retries only the current batch.
-    async fn rebuild_wallet_history(
-        &self,
-        federation_id: FederationId,
-        config: &ClientConfig,
-    ) -> anyhow::Result<()> {
-        let encoded_id = federation_id.consensus_encode_to_vec();
-        let decoders = decoders_from_config(config);
-        loop {
-            let mut connection = self.connection().await?;
-            let dbtx = connection.transaction().await?;
-            let Some(progress) = dbtx.query_opt("SELECT next_session FROM wallet_rebuild_progress WHERE federation_id=$1 FOR UPDATE", &[&encoded_id]).await? else {
-                return Ok(());
-            };
-            let next_session: i32 = progress.get(0);
-            let rows = dbtx.query("SELECT * FROM sessions WHERE federation_id=$1 AND session_index >= $2 ORDER BY session_index LIMIT 100", &[&encoded_id, &next_session]).await?;
-            if rows.is_empty() {
-                // Publish the rebuilt inventory before marking it complete.
-                dbtx.batch_execute("REFRESH MATERIALIZED VIEW utxos")
-                    .await?;
-                dbtx.execute(
-                    "DELETE FROM wallet_rebuild_progress WHERE federation_id=$1",
-                    &[&encoded_id],
-                )
-                .await?;
-                dbtx.commit().await?;
-                return Ok(());
-            }
-            let mut next = next_session;
-            for row in rows {
-                let outcome = db::SessionOutcome::from_row_with_decoders(&row, &decoders);
-                tokio::time::timeout(
-                    Duration::from_secs(30),
-                    self.process_session(
-                        federation_id,
-                        config.clone(),
-                        outcome.session_index as u64,
-                        outcome.data,
-                        &dbtx,
-                    ),
-                )
-                .await
-                .context("Wallet replay session timed out; checkpoint retained for retry")??;
-                next = outcome
-                    .session_index
-                    .checked_add(1)
-                    .context("Session index overflow")?;
-            }
-            dbtx.execute(
-                "UPDATE wallet_rebuild_progress SET next_session=$2 WHERE federation_id=$1",
-                &[&encoded_id, &next],
-            )
-            .await?;
-            dbtx.commit().await?;
-            info!("Wallet replay for {federation_id}: next session {next}");
-        }
-    }
-
-    pub async fn wallet_reconstruction_complete(
-        &self,
-        federation_id: FederationId,
-    ) -> anyhow::Result<bool> {
-        query_value::<bool>(
-            &self.connection().await?,
-            "SELECT NOT EXISTS(SELECT 1 FROM wallet_rebuild_progress WHERE federation_id=$1)",
-            &[&federation_id.consensus_encode_to_vec()],
-        )
-        .await
-    }
-
     pub async fn federation_utxos(
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<FederationUtxo>> {
-        self.get_federation(federation_id).await?;
-
         #[derive(Debug, FromRow)]
         struct FederationUtxoRaw {
             on_chain_txid: Vec<u8>,
@@ -1499,6 +1415,30 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<GuardianUtxoClaim>> {
+        let slot = self
+            .guardian_claims_cache
+            .lock()
+            .expect("guardian claims cache lock poisoned")
+            .entry(federation_id)
+            .or_default()
+            .clone();
+        // Held across the fetch so concurrent misses share one round of requests
+        let mut cached = slot.lock().await;
+        if let Some((fetched_at, claims)) = cached.as_ref() {
+            if fetched_at.elapsed() < GUARDIAN_CLAIMS_TTL {
+                return Ok(claims.clone());
+            }
+        }
+
+        let claims = self.fetch_guardian_utxo_claims(federation_id).await?;
+        *cached = Some((Instant::now(), claims.clone()));
+        Ok(claims)
+    }
+
+    async fn fetch_guardian_utxo_claims(
+        &self,
+        federation_id: FederationId,
+    ) -> anyhow::Result<Vec<GuardianUtxoClaim>> {
         let federation = self
             .get_federation(federation_id)
             .await?
@@ -1517,6 +1457,7 @@ impl FederationObserver {
                 .map(|peer_id| GuardianUtxoClaim {
                     guardian_id: peer_id.to_usize() as u16,
                     status: GuardianUtxoClaimStatus::Unavailable,
+                    session_count: None,
                     utxos: Vec::new(),
                     error: Some("federation config has no wallet module".to_owned()),
                 })
@@ -1535,42 +1476,65 @@ impl FederationObserver {
         )?;
         let module_api = api.with_module(wallet_module_id);
 
-        let claims = join_all(config.global.api_endpoints.keys().map(|peer_id| {
+        let mut claims = join_all(config.global.api_endpoints.keys().map(|&peer_id| {
+            let api = api.clone();
             let module_api = module_api.clone();
-            let peer_id = *peer_id;
             async move {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    module_api.request_single_peer::<WalletSummary>(
-                        WALLET_SUMMARY_ENDPOINT.to_owned(),
-                        ApiRequestErased::default(),
-                        peer_id,
-                    ),
+                let summary = module_api.request_single_peer::<WalletSummary>(
+                    WALLET_SUMMARY_ENDPOINT.to_owned(),
+                    ApiRequestErased::default(),
+                    peer_id,
+                );
+                let status = api.request_single_peer::<serde_json::Value>(
+                    STATUS_ENDPOINT.to_owned(),
+                    ApiRequestErased::default(),
+                    peer_id,
+                );
+                // Timed out separately so a slow status call can't discard a
+                // wallet summary that did arrive
+                let (summary, status) = futures::future::join(
+                    tokio::time::timeout(Duration::from_secs(10), summary),
+                    tokio::time::timeout(Duration::from_secs(10), status),
                 )
                 .await;
-                match result {
-                    Ok(Ok(summary)) => GuardianUtxoClaim {
-                        guardian_id: peer_id.to_usize() as u16,
-                        status: GuardianUtxoClaimStatus::Ok,
-                        utxos: wallet_summary_claimed_utxos(summary),
-                        error: None,
-                    },
-                    Ok(Err(error)) => GuardianUtxoClaim {
-                        guardian_id: peer_id.to_usize() as u16,
-                        status: GuardianUtxoClaimStatus::Error,
-                        utxos: Vec::new(),
-                        error: Some(error.to_string()),
-                    },
-                    Err(_) => GuardianUtxoClaim {
-                        guardian_id: peer_id.to_usize() as u16,
-                        status: GuardianUtxoClaimStatus::Error,
-                        utxos: Vec::new(),
-                        error: Some("Guardian wallet summary timed out".to_owned()),
-                    },
+
+                let guardian_id = peer_id.to_usize() as u16;
+                let (status, session_count, utxos, error) = match summary {
+                    Ok(Ok(summary)) => {
+                        let session_count = status.ok().and_then(Result::ok).and_then(|status| {
+                            status.get("federation")?.get("session_count")?.as_u64()
+                        });
+                        (
+                            GuardianUtxoClaimStatus::Ok,
+                            session_count,
+                            wallet_summary_claimed_utxos(summary),
+                            None,
+                        )
+                    }
+                    Ok(Err(error)) => (
+                        GuardianUtxoClaimStatus::Error,
+                        None,
+                        Vec::new(),
+                        Some(error.to_string()),
+                    ),
+                    Err(_) => (
+                        GuardianUtxoClaimStatus::Error,
+                        None,
+                        Vec::new(),
+                        Some("Guardian wallet summary timed out".to_owned()),
+                    ),
+                };
+                GuardianUtxoClaim {
+                    guardian_id,
+                    status,
+                    session_count,
+                    utxos,
+                    error,
                 }
             }
         }))
         .await;
+        mark_lagging_guardians(&mut claims, config.global.api_endpoints.len());
 
         Ok(claims)
     }
@@ -1772,6 +1736,35 @@ fn last_n_day_iter(now: NaiveDate, days: u32) -> impl Iterator<Item = NaiveDate>
         .map(move |day| now - chrono::Duration::days(day as i64))
 }
 
+/// Marks responding guardians whose session count is behind the federation as
+/// lagging: their wallet summary predates outputs the others already know.
+///
+/// The reference is the `f+1`-th highest reported count, so up to `f` faulty
+/// guardians claiming an inflated count cannot push honest ones out of the
+/// comparison. Guardians that did not report a count stay in.
+fn mark_lagging_guardians(claims: &mut [GuardianUtxoClaim], num_guardians: usize) {
+    let max_faulty = num_guardians.saturating_sub(1) / 3;
+    let mut session_counts = claims
+        .iter()
+        .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Ok))
+        .filter_map(|claim| claim.session_count)
+        .collect::<Vec<_>>();
+    session_counts.sort_unstable_by(|a, b| b.cmp(a));
+    let Some(&reference) = session_counts.get(max_faulty) else {
+        return;
+    };
+
+    for claim in claims {
+        if matches!(claim.status, GuardianUtxoClaimStatus::Ok)
+            && claim
+                .session_count
+                .is_some_and(|session_count| session_count < reference)
+        {
+            claim.status = GuardianUtxoClaimStatus::Lagging;
+        }
+    }
+}
+
 fn wallet_summary_claimed_utxos(summary: WalletSummary) -> Vec<GuardianClaimedUtxo> {
     let mut utxos = Vec::new();
     append_claimed_utxos(
@@ -1816,7 +1809,63 @@ fn append_claimed_utxos(
 
 #[cfg(test)]
 mod tests {
-    use crate::federation::observer::last_n_day_iter;
+    use fmo_api_types::{GuardianUtxoClaim, GuardianUtxoClaimStatus};
+
+    use crate::federation::observer::{last_n_day_iter, mark_lagging_guardians};
+
+    fn claim(guardian_id: u16, session_count: Option<u64>) -> GuardianUtxoClaim {
+        GuardianUtxoClaim {
+            guardian_id,
+            status: GuardianUtxoClaimStatus::Ok,
+            session_count,
+            utxos: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn lagging(claims: &[GuardianUtxoClaim]) -> Vec<u16> {
+        claims
+            .iter()
+            .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Lagging))
+            .map(|claim| claim.guardian_id)
+            .collect()
+    }
+
+    #[test]
+    fn guardian_behind_the_federation_is_lagging() {
+        let mut claims = [
+            claim(0, Some(100)),
+            claim(1, Some(100)),
+            claim(2, Some(100)),
+            claim(3, Some(97)),
+        ];
+        mark_lagging_guardians(&mut claims, 4);
+        assert_eq!(lagging(&claims), [3]);
+    }
+
+    #[test]
+    fn one_inflated_session_count_cannot_sideline_honest_guardians() {
+        let mut claims = [
+            claim(0, Some(1_000_000)),
+            claim(1, Some(100)),
+            claim(2, Some(100)),
+            claim(3, Some(100)),
+        ];
+        mark_lagging_guardians(&mut claims, 4);
+        assert!(lagging(&claims).is_empty());
+    }
+
+    #[test]
+    fn unknown_session_counts_never_mark_lagging() {
+        let mut claims = [
+            claim(0, Some(100)),
+            claim(1, None),
+            claim(2, None),
+            claim(3, None),
+        ];
+        mark_lagging_guardians(&mut claims, 4);
+        assert!(lagging(&claims).is_empty());
+    }
 
     #[test]
     fn test_day_iter() {

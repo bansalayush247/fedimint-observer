@@ -31,7 +31,6 @@ export interface FederationUtxo {
 }
 
 export interface FederationUtxosResponse {
-  reconstruction_complete: boolean;
   observed: FederationUtxo[];
   guardian_claims: GuardianUtxoClaim[];
   disagreements: GuardianUtxoDisagreement[];
@@ -39,7 +38,8 @@ export interface FederationUtxosResponse {
 
 export interface GuardianUtxoClaim {
   guardian_id: number;
-  status: 'unavailable' | 'ok' | 'error';
+  status: 'unavailable' | 'ok' | 'lagging' | 'error';
+  session_count: number | null;
   utxos: GuardianClaimedUtxo[];
   error: string | null;
 }
@@ -58,7 +58,7 @@ export type GuardianClaimedUtxoState =
   | 'unconfirmed_change';
 
 export interface GuardianUtxoDisagreement {
-  kind: 'evidence_mismatch' | 'inventory_difference';
+  kind: 'evidence_mismatch' | 'inventory_difference' | 'observer_difference';
   out_point: string;
   description: string;
 }

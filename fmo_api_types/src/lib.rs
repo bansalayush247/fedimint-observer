@@ -43,7 +43,6 @@ pub struct FederationUtxo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationUtxosResponse {
-    pub reconstruction_complete: bool,
     pub observed: Vec<FederationUtxo>,
     pub guardian_claims: Vec<GuardianUtxoClaim>,
     pub disagreements: Vec<GuardianUtxoDisagreement>,
@@ -53,6 +52,8 @@ pub struct FederationUtxosResponse {
 pub struct GuardianUtxoClaim {
     pub guardian_id: u16,
     pub status: GuardianUtxoClaimStatus,
+    /// Session count the guardian reported alongside its wallet summary
+    pub session_count: Option<u64>,
     pub utxos: Vec<GuardianClaimedUtxo>,
     pub error: Option<String>,
 }
@@ -62,6 +63,9 @@ pub struct GuardianUtxoClaim {
 pub enum GuardianUtxoClaimStatus {
     Unavailable,
     Ok,
+    /// Answered, but behind the federation's session count, so its wallet
+    /// summary is stale and left out of the comparison
+    Lagging,
     Error,
 }
 
@@ -92,8 +96,13 @@ pub struct GuardianUtxoDisagreement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianUtxoDisagreementKind {
+    /// Reported amounts for the same output differ
     EvidenceMismatch,
+    /// Responding guardians disagree on whether the output exists
     InventoryDifference,
+    /// All responding guardians agree, but the observer's history differs,
+    /// usually because it lags behind consensus or a peg-out is still pending
+    ObserverDifference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
