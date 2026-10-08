@@ -24,30 +24,36 @@ export interface FederationActivity {
   amount_transferred: number;
 }
 
-export interface FederationUtxo {
-  address: string;
-  out_point: string;
-  amount: number;
-}
-
 export interface FederationUtxosResponse {
-  observed: FederationUtxo[];
-  guardian_claims: GuardianUtxoClaim[];
-  disagreements: GuardianUtxoDisagreement[];
+  /** Guardians that must agree before an output counts as held or not held */
+  threshold: number;
+  guardians: GuardianUtxoReport[];
+  /** Most severe status first, then largest amount first */
+  utxos: UtxoComparisonRow[];
 }
 
-export interface GuardianUtxoClaim {
+export interface GuardianUtxoReport {
   guardian_id: number;
   status: 'unavailable' | 'ok' | 'lagging' | 'error';
   session_count: number | null;
-  utxos: GuardianClaimedUtxo[];
   error: string | null;
+  /** Outputs a threshold of guardians agrees are held that this guardian does not list */
+  missing_outputs: number;
+  /** Outputs this guardian lists that a threshold of guardians agrees are not held */
+  extra_outputs: number;
+  /** Outputs this guardian lists with another amount than the agreed one */
+  wrong_amounts: number;
 }
 
-export interface GuardianClaimedUtxo {
+export interface UtxoComparisonRow {
   out_point: string;
   amount: number;
-  state: GuardianClaimedUtxoState;
+  address: string | null;
+  /** Keyed by guardian id */
+  guardian_states: Record<string, GuardianClaimedUtxoState>;
+  status: 'mismatch' | 'pending' | 'verified';
+  disagreement: 'evidence_mismatch' | 'inventory_difference' | 'observer_difference' | 'on_chain_conflict' | null;
+  detail: string | null;
 }
 
 export type GuardianClaimedUtxoState =
@@ -56,12 +62,6 @@ export type GuardianClaimedUtxoState =
   | 'unsigned_change'
   | 'unconfirmed_peg_out'
   | 'unconfirmed_change';
-
-export interface GuardianUtxoDisagreement {
-  kind: 'evidence_mismatch' | 'inventory_difference' | 'observer_difference';
-  out_point: string;
-  description: string;
-}
 
 export interface GatewayInfo {
   gateway_id: string;

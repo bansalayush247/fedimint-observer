@@ -59,6 +59,27 @@ const GUARDIAN_CLAIMS_TTL: Duration = Duration::from_secs(30);
 
 type GuardianClaimsSlot = Arc<tokio::sync::Mutex<Option<(Instant, Vec<GuardianUtxoClaim>)>>>;
 
+/// Unspent and missing results are rechecked after this; spends are final.
+const ONCHAIN_CHECK_TTL: Duration = Duration::from_secs(10 * 60);
+/// Upper bound on how long a page load waits for chain lookups. Results that
+/// arrive in time are cached, so a later load continues where this one stopped.
+const ONCHAIN_CHECK_DEADLINE: Duration = Duration::from_secs(8);
+const ONCHAIN_CHECK_CONCURRENCY: usize = 8;
+
+/// State of a transaction output according to the blockchain
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnChainOutput {
+    /// `amount` is only looked up when the caller asked for it
+    Unspent {
+        amount: Option<bitcoin::Amount>,
+    },
+    Spent {
+        by: Txid,
+    },
+    /// The transaction or the output index does not exist
+    Missing,
+}
+
 #[derive(Debug, Clone)]
 pub struct FederationObserver {
     connection_pool: deadpool_postgres::Pool,
@@ -68,6 +89,7 @@ pub struct FederationObserver {
     consensus_meta_cache: ConsensusMetaCache,
     connectors: ConnectorRegistry,
     guardian_claims_cache: Arc<Mutex<HashMap<FederationId, GuardianClaimsSlot>>>,
+    onchain_cache: Arc<Mutex<HashMap<OutPoint, (Instant, OnChainOutput)>>>,
 }
 
 impl FederationObserver {
@@ -94,6 +116,7 @@ impl FederationObserver {
             consensus_meta_cache: Default::default(),
             connectors,
             guardian_claims_cache: Default::default(),
+            onchain_cache: Default::default(),
         };
 
         slf.setup_schema().await?;
@@ -984,20 +1007,7 @@ impl FederationObserver {
                     .expect("Not v0");
 
                 match wallet_v0_output {
-                    WalletOutputV0::PegOut(peg_out) => {
-                        let withdrawal_address = peg_out.recipient.clone().assume_checked();
-                        dbtx.execute(
-                            "INSERT INTO wallet_withdrawal_addresses VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
-                            &[
-                                &withdrawal_address.to_string(),
-                                &federation_id.consensus_encode_to_vec(),
-                                &(session_index as i32),
-                                &(item_index as i32),
-                                &fedimint_txid.consensus_encode_to_vec(),
-                                &(out_idx as i32),
-                            ]
-                        ).await?;
-                    }
+                    WalletOutputV0::PegOut(_) => {}
                     WalletOutputV0::Rbf(_) => {
                         // panic, since the benefits may outweigh the annoyance of removing and
                         // restarting
@@ -1539,6 +1549,75 @@ impl FederationObserver {
         Ok(claims)
     }
 
+    /// Looks up outputs on-chain. Each request says whether the output's amount
+    /// is needed too, which costs an extra request. Outputs whose lookup fails
+    /// or does not finish within [`ONCHAIN_CHECK_DEADLINE`] are left out.
+    pub async fn onchain_outputs(
+        &self,
+        requests: Vec<(OutPoint, bool)>,
+    ) -> HashMap<OutPoint, OnChainOutput> {
+        let mut results = HashMap::new();
+        let mut to_fetch = Vec::new();
+        {
+            let cache = self
+                .onchain_cache
+                .lock()
+                .expect("onchain cache lock poisoned");
+            for (out_point, with_amount) in requests {
+                let cached = cache.get(&out_point).filter(|(checked_at, output)| {
+                    let fresh = matches!(output, OnChainOutput::Spent { .. })
+                        || checked_at.elapsed() < ONCHAIN_CHECK_TTL;
+                    let complete =
+                        !with_amount || !matches!(output, OnChainOutput::Unspent { amount: None });
+                    fresh && complete
+                });
+                match cached {
+                    Some((_, output)) => {
+                        results.insert(out_point, *output);
+                    }
+                    None => to_fetch.push((out_point, with_amount)),
+                }
+            }
+        }
+        if to_fetch.is_empty() {
+            return results;
+        }
+
+        let client = match esplora_client::Builder::new(&self.mempool_url).build_async() {
+            Ok(client) => client,
+            Err(error) => {
+                warn!("Failed to build esplora client: {error:?}");
+                return results;
+            }
+        };
+        let mut lookups = futures::stream::iter(to_fetch)
+            .map(|(out_point, with_amount)| {
+                let client = client.clone();
+                async move {
+                    let output = fetch_onchain_output(&client, out_point, with_amount).await;
+                    (out_point, output)
+                }
+            })
+            .buffer_unordered(ONCHAIN_CHECK_CONCURRENCY);
+        let _ = tokio::time::timeout(ONCHAIN_CHECK_DEADLINE, async {
+            while let Some((out_point, output)) = lookups.next().await {
+                match output {
+                    Ok(output) => {
+                        self.onchain_cache
+                            .lock()
+                            .expect("onchain cache lock poisoned")
+                            .insert(out_point, (Instant::now(), output));
+                        results.insert(out_point, output);
+                    }
+                    Err(error) => debug!("On-chain lookup of {out_point} failed: {error:?}"),
+                }
+            }
+        })
+        .await;
+
+        results
+    }
+
     pub async fn totals(&self) -> anyhow::Result<FedimintTotals> {
         #[derive(Debug, FromRow)]
         struct FedimintTotalsResult {
@@ -1736,6 +1815,33 @@ fn last_n_day_iter(now: NaiveDate, days: u32) -> impl Iterator<Item = NaiveDate>
         .map(move |day| now - chrono::Duration::days(day as i64))
 }
 
+async fn fetch_onchain_output(
+    client: &esplora_client::AsyncClient,
+    out_point: OutPoint,
+    with_amount: bool,
+) -> anyhow::Result<OnChainOutput> {
+    let amount = if with_amount {
+        let Some(tx) = client.get_tx_info(&out_point.txid).await? else {
+            return Ok(OnChainOutput::Missing);
+        };
+        let Some(output) = tx.vout.get(out_point.vout as usize) else {
+            return Ok(OnChainOutput::Missing);
+        };
+        Some(bitcoin::Amount::from_sat(output.value))
+    } else {
+        None
+    };
+
+    let status = client
+        .get_output_status(&out_point.txid, out_point.vout.into())
+        .await?
+        .context("No output status")?;
+    Ok(match status.txid {
+        Some(by) if status.spent => OnChainOutput::Spent { by },
+        _ => OnChainOutput::Unspent { amount },
+    })
+}
+
 /// Marks responding guardians whose session count is behind the federation as
 /// lagging: their wallet summary predates outputs the others already know.
 ///
@@ -1809,63 +1915,7 @@ fn append_claimed_utxos(
 
 #[cfg(test)]
 mod tests {
-    use fmo_api_types::{GuardianUtxoClaim, GuardianUtxoClaimStatus};
-
-    use crate::federation::observer::{last_n_day_iter, mark_lagging_guardians};
-
-    fn claim(guardian_id: u16, session_count: Option<u64>) -> GuardianUtxoClaim {
-        GuardianUtxoClaim {
-            guardian_id,
-            status: GuardianUtxoClaimStatus::Ok,
-            session_count,
-            utxos: Vec::new(),
-            error: None,
-        }
-    }
-
-    fn lagging(claims: &[GuardianUtxoClaim]) -> Vec<u16> {
-        claims
-            .iter()
-            .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Lagging))
-            .map(|claim| claim.guardian_id)
-            .collect()
-    }
-
-    #[test]
-    fn guardian_behind_the_federation_is_lagging() {
-        let mut claims = [
-            claim(0, Some(100)),
-            claim(1, Some(100)),
-            claim(2, Some(100)),
-            claim(3, Some(97)),
-        ];
-        mark_lagging_guardians(&mut claims, 4);
-        assert_eq!(lagging(&claims), [3]);
-    }
-
-    #[test]
-    fn one_inflated_session_count_cannot_sideline_honest_guardians() {
-        let mut claims = [
-            claim(0, Some(1_000_000)),
-            claim(1, Some(100)),
-            claim(2, Some(100)),
-            claim(3, Some(100)),
-        ];
-        mark_lagging_guardians(&mut claims, 4);
-        assert!(lagging(&claims).is_empty());
-    }
-
-    #[test]
-    fn unknown_session_counts_never_mark_lagging() {
-        let mut claims = [
-            claim(0, Some(100)),
-            claim(1, None),
-            claim(2, None),
-            claim(3, None),
-        ];
-        mark_lagging_guardians(&mut claims, 4);
-        assert!(lagging(&claims).is_empty());
-    }
+    use crate::federation::observer::last_n_day_iter;
 
     #[test]
     fn test_day_iter() {

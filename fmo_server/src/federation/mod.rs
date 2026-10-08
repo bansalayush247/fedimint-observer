@@ -7,7 +7,7 @@ pub mod observer;
 mod session;
 mod transaction;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Context;
 use axum::extract::{Path, State};
@@ -22,8 +22,9 @@ use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::Amount;
 use fmo_api_types::{
     FederationSummary, FederationUtxo, FederationUtxosResponse, FedimintTotals,
-    GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus, GuardianUtxoDisagreement,
-    GuardianUtxoDisagreementKind, NonceSpendInfo, NoncesRequest,
+    GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus,
+    GuardianUtxoDisagreementKind, GuardianUtxoReport, NonceSpendInfo, NoncesRequest,
+    UtxoComparisonRow, UtxoComparisonStatus,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -31,6 +32,7 @@ use serde_json::json;
 use crate::federation::gateways::{get_federation_gateway_uptime_trend, get_federation_gateways};
 use crate::federation::guardians::get_federation_health;
 use crate::federation::meta::get_federation_meta;
+use crate::federation::observer::OnChainOutput;
 use crate::federation::session::{count_sessions, list_sessions};
 use crate::federation::transaction::{
     count_transactions, list_transactions, transaction, transaction_histogram,
@@ -151,301 +153,525 @@ async fn get_federation_utxos(
         observer.federation_utxos(federation_id),
         observer.guardian_utxo_claims(federation_id),
     )?;
-    let disagreements = guardian_utxo_disagreements(&observed, &guardian_claims);
-
-    Ok(FederationUtxosResponse {
-        observed,
-        guardian_claims,
-        disagreements,
-    }
-    .into())
+    let mut comparison = compare_utxos(&observed, &guardian_claims);
+    let onchain = observer
+        .onchain_outputs(comparison.onchain_check_requests())
+        .await;
+    comparison.apply_onchain_evidence(&onchain);
+    Ok(comparison.into_response().into())
 }
 
-/// Whether the observer's reconstruction should also hold an output that a
-/// guardian reports in this state. The observer records peg-out change once
-/// the transaction reaches threshold signatures, while guardians keep it in
-/// `UnconfirmedChange` until the finality delay has passed.
-fn observer_should_hold(state: GuardianClaimedUtxoState) -> bool {
+/// Every output judged against what a threshold of guardians agrees on, and
+/// how each guardian deviates from that agreement
+struct UtxoComparison {
+    threshold: usize,
+    any_responding: bool,
+    rows: Vec<UtxoComparisonRow>,
+    guardians: Vec<GuardianUtxoReport>,
+}
+
+/// What one responding guardian says about one output
+enum GuardianView {
+    /// Lists it as held by the federation; `None` if it lists several amounts
+    Holds(Option<Amount>),
+    /// Lists it only as part of a peg-out still in flight, so it neither
+    /// confirms nor disputes that the federation holds it
+    InFlight,
+    Absent,
+}
+
+/// Whether a guardian listing an output in this state says the federation
+/// holds it. Guardians keep peg-out change in `UnconfirmedChange` until the
+/// finality delay has passed, while the observer records it at threshold
+/// signatures.
+fn is_held(state: GuardianClaimedUtxoState) -> bool {
     matches!(
         state,
         GuardianClaimedUtxoState::Spendable | GuardianClaimedUtxoState::UnconfirmedChange
     )
 }
 
-/// Compares the observer's reconstructed UTXO set with every responding
-/// guardian's wallet summary, reporting at most one disagreement per output.
-fn guardian_utxo_disagreements(
+fn compare_utxos(
     observed: &[FederationUtxo],
     guardian_claims: &[GuardianUtxoClaim],
-) -> Vec<GuardianUtxoDisagreement> {
+) -> UtxoComparison {
+    // Fedimint tolerates f = (n - 1) / 3 faulty guardians and acts on what
+    // n - f of them agree on, so that agreement is what honest guardians hold
+    let num_guardians = guardian_claims.len();
+    let threshold = num_guardians - num_guardians.saturating_sub(1) / 3;
     let responding = guardian_claims
         .iter()
         .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Ok))
+        .map(|claim| claim.guardian_id)
         .collect::<Vec<_>>();
-    if responding.is_empty() {
-        return Vec::new();
-    }
 
-    // Ordered so the disagreement list is stable between requests
     let mut outputs = BTreeMap::<OutPoint, OutputReports>::new();
     for utxo in observed {
-        outputs.entry(utxo.out_point).or_default().observed = Some(utxo.amount);
+        outputs.entry(utxo.out_point).or_default().observed = Some(utxo);
     }
-    for claim in &responding {
+    for claim in guardian_claims
+        .iter()
+        .filter(|claim| matches!(claim.status, GuardianUtxoClaimStatus::Ok))
+    {
         for utxo in &claim.utxos {
-            if observer_should_hold(utxo.state) {
-                let reports = outputs.entry(utxo.out_point).or_default();
-                reports.held.push((claim.guardian_id, utxo.amount));
-            } else if utxo.state == GuardianClaimedUtxoState::UnsignedChange {
-                let reports = outputs.entry(utxo.out_point).or_default();
-                reports.unsigned.push(claim.guardian_id);
+            outputs
+                .entry(utxo.out_point)
+                .or_default()
+                .listed
+                .entry(claim.guardian_id)
+                .or_default()
+                .push(utxo);
+        }
+    }
+
+    let mut findings = BTreeMap::<u16, GuardianFindings>::new();
+    let rows = outputs
+        .into_iter()
+        .map(|(out_point, reports)| {
+            judge_output(
+                out_point,
+                &reports,
+                &responding,
+                num_guardians,
+                threshold,
+                &mut findings,
+            )
+        })
+        .collect();
+
+    UtxoComparison {
+        threshold,
+        any_responding: !responding.is_empty(),
+        rows,
+        guardians: guardian_claims
+            .iter()
+            .map(|claim| {
+                let findings = findings
+                    .get(&claim.guardian_id)
+                    .copied()
+                    .unwrap_or_default();
+                GuardianUtxoReport {
+                    guardian_id: claim.guardian_id,
+                    status: claim.status,
+                    session_count: claim.session_count,
+                    error: claim.error.clone(),
+                    missing_outputs: findings.missing_outputs,
+                    extra_outputs: findings.extra_outputs,
+                    wrong_amounts: findings.wrong_amounts,
+                }
+            })
+            .collect(),
+    }
+}
+
+#[derive(Default)]
+struct OutputReports<'a> {
+    observed: Option<&'a FederationUtxo>,
+    /// Entries of responding guardians, usually one each
+    listed: BTreeMap<u16, Vec<&'a GuardianClaimedUtxo>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct GuardianFindings {
+    missing_outputs: u32,
+    extra_outputs: u32,
+    wrong_amounts: u32,
+}
+
+fn judge_output(
+    out_point: OutPoint,
+    reports: &OutputReports,
+    responding: &[u16],
+    num_guardians: usize,
+    threshold: usize,
+    findings: &mut BTreeMap<u16, GuardianFindings>,
+) -> UtxoComparisonRow {
+    let views = responding
+        .iter()
+        .map(|guardian_id| {
+            let view = match reports.listed.get(guardian_id) {
+                None => GuardianView::Absent,
+                Some(entries) => {
+                    let amounts = entries
+                        .iter()
+                        .filter(|utxo| is_held(utxo.state))
+                        .map(|utxo| utxo.amount)
+                        .collect::<BTreeSet<_>>();
+                    match amounts.len() {
+                        0 => GuardianView::InFlight,
+                        1 => GuardianView::Holds(amounts.first().copied()),
+                        _ => GuardianView::Holds(None),
+                    }
+                }
+            };
+            (*guardian_id, view)
+        })
+        .collect::<Vec<_>>();
+    let holders = views
+        .iter()
+        .filter_map(|(guardian_id, view)| match view {
+            GuardianView::Holds(amount) => Some((*guardian_id, *amount)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let absent = views
+        .iter()
+        .filter(|(_, view)| matches!(view, GuardianView::Absent))
+        .map(|(guardian_id, _)| *guardian_id)
+        .collect::<Vec<_>>();
+    let pending_states = reports
+        .listed
+        .values()
+        .flatten()
+        .filter_map(|utxo| pending_state_label(utxo.state))
+        .collect::<BTreeSet<_>>();
+
+    let mut row = UtxoComparisonRow {
+        out_point,
+        amount: reports
+            .observed
+            .map(|utxo| utxo.amount)
+            .or_else(|| holders.iter().find_map(|(_, amount)| *amount))
+            .or_else(|| {
+                reports
+                    .listed
+                    .values()
+                    .flatten()
+                    .next()
+                    .map(|utxo| utxo.amount)
+            })
+            .unwrap_or(Amount::from_msats(0)),
+        address: reports.observed.map(|utxo| utxo.address.clone()),
+        // Shown per guardian, preferring the entry that says it is held
+        guardian_states: reports
+            .listed
+            .iter()
+            .filter_map(|(guardian_id, entries)| {
+                let entry = entries
+                    .iter()
+                    .find(|utxo| is_held(utxo.state))
+                    .or(entries.first())?;
+                Some((*guardian_id, entry.state))
+            })
+            .collect(),
+        status: UtxoComparisonStatus::Pending,
+        disagreement: None,
+        detail: None,
+    };
+    if holders.len() >= threshold && !responding.is_empty() {
+        for guardian_id in &absent {
+            findings.entry(*guardian_id).or_default().missing_outputs += 1;
+        }
+        let mut votes = BTreeMap::<Amount, usize>::new();
+        for amount in holders.iter().filter_map(|(_, amount)| *amount) {
+            *votes.entry(amount).or_default() += 1;
+        }
+        let Some(agreed) = votes
+            .into_iter()
+            .find_map(|(amount, count)| (count >= threshold).then_some(amount))
+        else {
+            mark(
+                &mut row,
+                UtxoComparisonStatus::Mismatch,
+                Some(GuardianUtxoDisagreementKind::EvidenceMismatch),
+                format!(
+                    "Guardians list this output but cannot agree on its amount: {}",
+                    amount_reports(reports.observed, &holders)
+                ),
+            );
+            return row;
+        };
+
+        let wrong = holders
+            .iter()
+            .filter(|(_, amount)| *amount != Some(agreed))
+            .map(|(guardian_id, _)| *guardian_id)
+            .collect::<Vec<_>>();
+        for guardian_id in &wrong {
+            findings.entry(*guardian_id).or_default().wrong_amounts += 1;
+        }
+        let wrong_note = (!wrong.is_empty()).then(|| {
+            format!(
+                "{} a different amount.",
+                capitalized(&guardians_verb(&wrong, "reports", "report"))
+            )
+        });
+
+        match reports.observed {
+            Some(utxo) if utxo.amount != agreed => mark(
+                &mut row,
+                UtxoComparisonStatus::Mismatch,
+                Some(GuardianUtxoDisagreementKind::EvidenceMismatch),
+                format!(
+                    "Observer history reports {} msat, but guardians agree on {} msat",
+                    utxo.amount.msats, agreed.msats
+                ),
+            ),
+            Some(_) => {
+                let final_holders = holders
+                    .iter()
+                    .filter(|(guardian_id, _)| {
+                        reports.listed[guardian_id]
+                            .iter()
+                            .all(|utxo| utxo.state == GuardianClaimedUtxoState::Spendable)
+                    })
+                    .count();
+                if final_holders >= threshold {
+                    row.status = UtxoComparisonStatus::Verified;
+                    row.detail = wrong_note;
+                } else {
+                    row.detail = Some(
+                        [Some(still_pending(&pending_states)), wrong_note]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+            }
+            None => {
+                row.amount = agreed;
+                mark(
+                    &mut row,
+                    UtxoComparisonStatus::Pending,
+                    Some(GuardianUtxoDisagreementKind::ObserverDifference),
+                    "Guardians agree the federation holds this output, but observer history does not have it yet".to_owned(),
+                );
+            }
+        }
+    } else if absent.len() >= threshold {
+        for (guardian_id, _) in &holders {
+            findings.entry(*guardian_id).or_default().extra_outputs += 1;
+        }
+        let holder_ids = holders
+            .iter()
+            .map(|(guardian_id, _)| *guardian_id)
+            .collect::<Vec<_>>();
+        if reports.observed.is_some() {
+            // Guardians stop listing an output once it is an input of a peg-out,
+            // while the observer only records the spend at threshold signatures
+            let still_listed = if holder_ids.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " {} it.",
+                    capitalized(&guardians_verb(&holder_ids, "still lists", "still list"))
+                )
+            };
+            mark(
+                &mut row,
+                UtxoComparisonStatus::Pending,
+                Some(GuardianUtxoDisagreementKind::ObserverDifference),
+                format!("Guardians agree the federation no longer holds this output, but observer history still lists it; it may be an input of a peg-out still collecting signatures.{still_listed}"),
+            );
+        } else if !holder_ids.is_empty() {
+            mark(
+                &mut row,
+                UtxoComparisonStatus::Mismatch,
+                Some(GuardianUtxoDisagreementKind::InventoryDifference),
+                format!(
+                    "Only {} this output; the other guardians agree the federation does not hold it",
+                    guardians_verb(&holder_ids, "lists", "list")
+                ),
+            );
+        } else if !pending_states.is_empty() {
+            row.detail = Some(still_pending(&pending_states));
+        }
+    } else if !holders.is_empty() && !absent.is_empty() {
+        let holder_ids = holders
+            .iter()
+            .map(|(guardian_id, _)| *guardian_id)
+            .collect::<Vec<_>>();
+        let detail = format!(
+            "Guardians are split: {} it, {} not; {threshold} of {num_guardians} must agree",
+            guardians_verb(&holder_ids, "lists", "list"),
+            guardians_verb(&absent, "does", "do"),
+        );
+        if responding.len() >= threshold {
+            // More guardians deviate than the federation can tolerate
+            mark(
+                &mut row,
+                UtxoComparisonStatus::Mismatch,
+                Some(GuardianUtxoDisagreementKind::InventoryDifference),
+                detail,
+            );
+        } else {
+            row.detail = Some(detail);
+        }
+    } else if !pending_states.is_empty() {
+        row.detail = Some(still_pending(&pending_states));
+    }
+    // Anything else stays pending without detail: too few guardians responded
+    // to reach the threshold, which the response's guardian list shows
+
+    row
+}
+
+fn mark(
+    row: &mut UtxoComparisonRow,
+    status: UtxoComparisonStatus,
+    kind: Option<GuardianUtxoDisagreementKind>,
+    detail: String,
+) {
+    row.status = status;
+    row.disagreement = kind;
+    row.detail = Some(detail);
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+fn pending_state_label(state: GuardianClaimedUtxoState) -> Option<&'static str> {
+    match state {
+        GuardianClaimedUtxoState::Spendable => None,
+        GuardianClaimedUtxoState::UnsignedPegOut => Some("unsigned peg out"),
+        GuardianClaimedUtxoState::UnsignedChange => Some("unsigned change"),
+        GuardianClaimedUtxoState::UnconfirmedPegOut => Some("unconfirmed peg out"),
+        GuardianClaimedUtxoState::UnconfirmedChange => Some("unconfirmed change"),
+    }
+}
+
+fn still_pending(states: &BTreeSet<&str>) -> String {
+    format!(
+        "This output is still pending: {}.",
+        states.iter().copied().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// "Guardian 1 reports" or "Guardians 0, 2 report"
+fn guardians_verb(guardian_ids: &[u16], singular: &str, plural: &str) -> String {
+    let ids = guardian_ids
+        .iter()
+        .map(|guardian_id| guardian_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if guardian_ids.len() == 1 {
+        format!("guardian {ids} {singular}")
+    } else {
+        format!("guardians {ids} {plural}")
+    }
+}
+
+fn amount_reports(observed: Option<&FederationUtxo>, holders: &[(u16, Option<Amount>)]) -> String {
+    observed
+        .map(|utxo| format!("observer reports {} msat", utxo.amount.msats))
+        .into_iter()
+        .chain(holders.iter().map(|(guardian_id, amount)| match amount {
+            Some(amount) => format!("guardian {guardian_id} reports {} msat", amount.msats),
+            None => format!("guardian {guardian_id} lists several amounts"),
+        }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl UtxoComparison {
+    /// Outputs guardians cannot vouch for, to be looked up on-chain, and
+    /// whether their amount is needed. Without any responding guardian that is
+    /// every output the observer holds; otherwise only outputs where the
+    /// observer differs from the guardians, since chain lookups are slow.
+    fn onchain_check_requests(&self) -> Vec<(OutPoint, bool)> {
+        self.rows
+            .iter()
+            .filter_map(|row| {
+                let observed = row.address.is_some();
+                if !self.any_responding {
+                    return observed.then_some((row.out_point, false));
+                }
+                if row.disagreement != Some(GuardianUtxoDisagreementKind::ObserverDifference) {
+                    return None;
+                }
+                if observed {
+                    return Some((row.out_point, false));
+                }
+                // Change may not have been broadcast yet, so only outputs every
+                // guardian considers final must exist on-chain
+                row.guardian_states
+                    .values()
+                    .all(|state| *state == GuardianClaimedUtxoState::Spendable)
+                    .then_some((row.out_point, true))
+            })
+            .collect()
+    }
+
+    /// Uses on-chain state to settle outputs guardians could not confirm. The
+    /// chain is authoritative: an output it shows as spent, missing or holding
+    /// a different amount than reported becomes an [`OnChainConflict`].
+    ///
+    /// [`OnChainConflict`]: GuardianUtxoDisagreementKind::OnChainConflict
+    fn apply_onchain_evidence(&mut self, onchain: &HashMap<OutPoint, OnChainOutput>) {
+        for row in &mut self.rows {
+            let Some(&output) = onchain.get(&row.out_point) else {
+                continue;
+            };
+            let conflict = Some(GuardianUtxoDisagreementKind::OnChainConflict);
+
+            if !self.any_responding {
+                // Nobody else can confirm the observer's history, e.g. because
+                // the federation is offline, so a spend it missed goes unnoticed
+                if let OnChainOutput::Spent { by } = output {
+                    mark(row, UtxoComparisonStatus::Mismatch, conflict, format!(
+                        "Already spent on-chain by transaction {by}, but observer history still lists it and no guardian responded"
+                    ));
+                }
+                continue;
+            }
+
+            if row.address.is_some() {
+                // Guardians already dropped it; the chain tells whether the
+                // spend happened or a peg-out is still collecting signatures
+                if let OnChainOutput::Spent { by } = output {
+                    row.detail = Some(format!(
+                        "Spent on-chain by transaction {by}; observer history has not caught up yet"
+                    ));
+                }
+                continue;
+            }
+
+            match output {
+                OnChainOutput::Missing => mark(row, UtxoComparisonStatus::Mismatch, conflict,
+                    "Guardians agree the federation holds this output, but it does not exist on-chain".to_owned(),
+                ),
+                OnChainOutput::Spent { by } => mark(row, UtxoComparisonStatus::Mismatch, conflict, format!(
+                    "Guardians agree the federation holds this output, but it was already spent on-chain by transaction {by}"
+                )),
+                OnChainOutput::Unspent {
+                    amount: Some(amount),
+                } if Amount::from_sats(amount.to_sat()) != row.amount => mark(row, UtxoComparisonStatus::Mismatch, conflict, format!(
+                    "Guardians agree on {} msat, but the output holds {} msat on-chain",
+                    row.amount.msats,
+                    Amount::from_sats(amount.to_sat()).msats
+                )),
+                OnChainOutput::Unspent { amount: Some(_) } => {
+                    row.detail = Some("Guardians agree the federation holds this output and it is unspent on-chain, but observer history does not have it yet".to_owned());
+                }
+                OnChainOutput::Unspent { amount: None } => {}
             }
         }
     }
 
-    outputs
-        .into_iter()
-        .filter_map(|(out_point, reports)| {
-            let (kind, description) = classify_output(&reports, &responding)?;
-            Some(GuardianUtxoDisagreement {
-                kind,
-                out_point,
-                description,
-            })
-        })
-        .collect()
-}
-
-#[derive(Default)]
-struct OutputReports {
-    observed: Option<Amount>,
-    /// Guardians listing the output in a state the observer should also hold
-    held: Vec<(u16, Amount)>,
-    /// Guardians that still see the output as change of an unsigned peg-out.
-    /// They are a step behind, so they neither confirm nor dispute it.
-    unsigned: Vec<u16>,
-}
-
-fn classify_output(
-    reports: &OutputReports,
-    responding: &[&GuardianUtxoClaim],
-) -> Option<(GuardianUtxoDisagreementKind, String)> {
-    let OutputReports {
-        observed,
-        held,
-        unsigned,
-    } = reports;
-    let reference = observed.or_else(|| held.first().map(|(_, amount)| *amount))?;
-    if held.iter().any(|(_, amount)| *amount != reference) {
-        let amounts = observed
-            .map(|amount| format!("observer reports {} msat", amount.msats))
-            .into_iter()
-            .chain(held.iter().map(|(guardian_id, amount)| {
-                format!("guardian {guardian_id} reports {} msat", amount.msats)
-            }))
-            .collect::<Vec<_>>();
-        return Some((
-            GuardianUtxoDisagreementKind::EvidenceMismatch,
-            format!("Reported amounts differ: {}", amounts.join(", ")),
-        ));
+    fn into_response(mut self) -> FederationUtxosResponse {
+        self.rows.sort_by(|left, right| {
+            left.status
+                .cmp(&right.status)
+                .then(right.amount.cmp(&left.amount))
+        });
+        FederationUtxosResponse {
+            threshold: self.threshold,
+            guardians: self.guardians,
+            utxos: self.rows,
+        }
     }
-
-    let missing = responding
-        .iter()
-        .map(|claim| claim.guardian_id)
-        .filter(|guardian_id| {
-            !held.iter().any(|(holder, _)| holder == guardian_id) && !unsigned.contains(guardian_id)
-        })
-        .collect::<Vec<_>>();
-
-    match (observed.is_some(), held.is_empty(), missing.is_empty()) {
-        (_, false, false) => Some((
-            GuardianUtxoDisagreementKind::InventoryDifference,
-            format!(
-                "Guardians disagree: reported by guardians {}, missing from guardians {}; {}",
-                join_ids(held.iter().map(|(guardian_id, _)| *guardian_id)),
-                join_ids(missing),
-                if observed.is_some() {
-                    "observer history has it"
-                } else {
-                    "observer history does not"
-                },
-            ),
-        )),
-        // Every responding guardian agrees, so the difference is on the
-        // observer's side: it lags behind consensus, or the output is an input
-        // of a peg-out that guardians already reserved but that has not reached
-        // threshold signatures (guardian summaries do not list those inputs).
-        (true, true, false) => Some((
-            GuardianUtxoDisagreementKind::ObserverDifference,
-            "Observer history has this output unspent, but no responding guardian lists it; it may be an input of a peg-out still collecting signatures".to_owned(),
-        )),
-        (false, false, true) => Some((
-            GuardianUtxoDisagreementKind::ObserverDifference,
-            "All responding guardians report this output, but observer history does not have it yet".to_owned(),
-        )),
-        _ => None,
-    }
-}
-
-fn join_ids(guardian_ids: impl IntoIterator<Item = u16>) -> String {
-    guardian_ids
-        .into_iter()
-        .map(|guardian_id| guardian_id.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 async fn get_federation_totals(
     State(state): State<AppState>,
 ) -> crate::error::Result<Json<FedimintTotals>> {
     Ok(state.federation_observer.totals().await?.into())
-}
-
-#[cfg(test)]
-mod utxo_tests {
-    use fmo_api_types::GuardianClaimedUtxo;
-
-    use super::*;
-
-    fn observed() -> FederationUtxo {
-        FederationUtxo {
-            out_point: OutPoint::null(),
-            address: bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), bitcoin::Network::Bitcoin)
-                .as_unchecked()
-                .clone(),
-            amount: Amount::from_sats(100),
-        }
-    }
-
-    fn claim(id: u16) -> GuardianUtxoClaim {
-        GuardianUtxoClaim {
-            guardian_id: id,
-            status: GuardianUtxoClaimStatus::Ok,
-            session_count: Some(100),
-            error: None,
-            utxos: vec![GuardianClaimedUtxo {
-                out_point: OutPoint::null(),
-                amount: Amount::from_sats(100),
-                state: GuardianClaimedUtxoState::Spendable,
-            }],
-        }
-    }
-
-    #[test]
-    fn omitted_utxo_remains_an_inventory_difference() {
-        let mut missing = claim(1);
-        missing.utxos.clear();
-        let differences = guardian_utxo_disagreements(&[observed()], &[claim(0), missing]);
-        assert_eq!(differences.len(), 1);
-        assert_eq!(
-            differences[0].kind,
-            GuardianUtxoDisagreementKind::InventoryDifference
-        );
-    }
-
-    #[test]
-    fn false_amount_is_an_evidence_mismatch() {
-        let mut false_claim = claim(0);
-        false_claim.utxos[0].amount = Amount::from_sats(999);
-        let differences = guardian_utxo_disagreements(&[observed()], &[false_claim]);
-        assert!(differences
-            .iter()
-            .any(|difference| difference.kind == GuardianUtxoDisagreementKind::EvidenceMismatch));
-    }
-
-    #[test]
-    fn unsigned_change_is_not_a_missing_spendable_utxo() {
-        let mut pending = claim(0);
-        pending.utxos[0].state = GuardianClaimedUtxoState::UnsignedChange;
-        assert!(guardian_utxo_disagreements(&[], &[pending]).is_empty());
-    }
-
-    #[test]
-    fn unavailable_guardian_does_not_create_a_false_disagreement() {
-        let unavailable = GuardianUtxoClaim {
-            guardian_id: 1,
-            status: GuardianUtxoClaimStatus::Unavailable,
-            session_count: None,
-            utxos: Vec::new(),
-            error: Some("Guardian does not expose wallet summary".to_owned()),
-        };
-
-        assert!(guardian_utxo_disagreements(&[observed()], &[claim(0), unavailable]).is_empty());
-    }
-
-    #[test]
-    fn matching_guardian_claims_do_not_create_a_disagreement() {
-        assert!(guardian_utxo_disagreements(&[observed()], &[claim(0), claim(1)]).is_empty());
-    }
-
-    #[test]
-    fn guardian_amount_conflict_is_detected_without_observer_history() {
-        let mut conflicting = claim(1);
-        conflicting.utxos[0].amount = Amount::from_sats(999);
-        let differences = guardian_utxo_disagreements(&[], &[claim(0), conflicting]);
-        assert!(differences
-            .iter()
-            .any(|difference| difference.kind == GuardianUtxoDisagreementKind::EvidenceMismatch));
-    }
-
-    #[test]
-    fn guardian_still_seeing_unsigned_change_is_not_missing_it() {
-        let mut behind = claim(1);
-        behind.utxos[0].state = GuardianClaimedUtxoState::UnsignedChange;
-        assert!(guardian_utxo_disagreements(&[observed()], &[claim(0), behind]).is_empty());
-    }
-
-    #[test]
-    fn lagging_guardian_is_left_out_of_the_comparison() {
-        let mut lagging = claim(1);
-        lagging.status = GuardianUtxoClaimStatus::Lagging;
-        lagging.utxos.clear();
-        assert!(guardian_utxo_disagreements(&[observed()], &[claim(0), lagging]).is_empty());
-    }
-
-    #[test]
-    fn unconfirmed_change_matches_observed_change() {
-        let mut change = claim(0);
-        change.utxos[0].state = GuardianClaimedUtxoState::UnconfirmedChange;
-        assert!(guardian_utxo_disagreements(&[observed()], &[change, claim(1)]).is_empty());
-    }
-
-    #[test]
-    fn output_no_guardian_lists_is_an_observer_difference() {
-        let mut empty = claim(0);
-        empty.utxos.clear();
-        let differences = guardian_utxo_disagreements(&[observed()], &[empty]);
-        assert_eq!(differences.len(), 1);
-        assert_eq!(
-            differences[0].kind,
-            GuardianUtxoDisagreementKind::ObserverDifference
-        );
-    }
-
-    #[test]
-    fn output_only_guardians_report_is_an_observer_difference() {
-        let differences = guardian_utxo_disagreements(&[], &[claim(0), claim(1)]);
-        assert_eq!(differences.len(), 1);
-        assert_eq!(
-            differences[0].kind,
-            GuardianUtxoDisagreementKind::ObserverDifference
-        );
-    }
-
-    #[test]
-    fn guardian_split_is_reported_once_per_output() {
-        let mut missing = claim(1);
-        missing.utxos.clear();
-        let mut also_missing = claim(2);
-        also_missing.utxos.clear();
-        let differences = guardian_utxo_disagreements(&[], &[claim(0), missing, also_missing]);
-        assert_eq!(differences.len(), 1);
-        assert_eq!(
-            differences[0].kind,
-            GuardianUtxoDisagreementKind::InventoryDifference
-        );
-    }
 }
 
 async fn publish_rating_event(

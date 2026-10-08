@@ -1,3 +1,8 @@
+-- Linked peg-outs to on-chain transactions via recipient addresses, which are
+-- dropped below. Must happen before the txid rewrite: the rewrite leaves
+-- deferred foreign key checks pending, and those block ALTER TABLE.
+ALTER TABLE wallet_withdrawal_transactions DROP COLUMN federation_txid;
+
 -- Bitcoin txids use their raw hash bytes everywhere. Older withdrawal tables
 -- stored display-order bytes, unlike deposits. Reverse only the legacy tables.
 ALTER TABLE wallet_withdrawal_signatures ALTER CONSTRAINT wallet_withdrawal_signatures_on_chain_txid_fkey DEFERRABLE INITIALLY DEFERRED;
@@ -39,6 +44,9 @@ WHERE NOT EXISTS (
 )
 ORDER BY c.on_chain_txid, c.on_chain_vout, c.ownership_priority;
 CREATE UNIQUE INDEX on_chain_txid_on_chain_vout ON utxos(on_chain_txid, on_chain_vout);
+-- Recipient addresses only told change apart from payouts in the old view;
+-- change is now identified by its output index, so nothing reads them anymore
+DROP TABLE wallet_withdrawal_addresses;
 -- The UTXO endpoint always filters by federation
 CREATE INDEX utxos_federation_id ON utxos(federation_id);
 INSERT INTO schema_version(version) VALUES (11);
