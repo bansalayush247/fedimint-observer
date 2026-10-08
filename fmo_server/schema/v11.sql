@@ -5,13 +5,31 @@ ALTER TABLE wallet_withdrawal_transactions DROP COLUMN federation_txid;
 
 -- Bitcoin txids use their raw hash bytes everywhere. Older withdrawal tables
 -- stored display-order bytes, unlike deposits. Reverse only the legacy tables.
-ALTER TABLE wallet_withdrawal_signatures ALTER CONSTRAINT wallet_withdrawal_signatures_on_chain_txid_fkey DEFERRABLE INITIALLY DEFERRED;
-ALTER TABLE wallet_withdrawal_transaction_inputs ALTER CONSTRAINT wallet_withdrawal_transaction_inputs_on_chain_txid_fkey DEFERRABLE INITIALLY DEFERRED;
-ALTER TABLE wallet_withdrawal_transaction_outputs ALTER CONSTRAINT wallet_withdrawal_transaction_outputs_on_chain_txid_fkey DEFERRABLE INITIALLY DEFERRED;
+-- Foreign keys onto the withdrawal transactions must be deferred so txids can
+-- be rewritten in place. Databases restored from dumps may name them
+-- differently or lack them entirely, so look them up instead of naming them.
+DO $$
+DECLARE
+    fk RECORD;
+BEGIN
+    FOR fk IN
+        SELECT conrelid::regclass AS referencing_table, conname
+        FROM pg_constraint
+        WHERE contype = 'f'
+          AND confrelid = 'wallet_withdrawal_transactions'::regclass
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s ALTER CONSTRAINT %I DEFERRABLE INITIALLY DEFERRED',
+            fk.referencing_table, fk.conname
+        );
+    END LOOP;
+END
+$$;
 CREATE FUNCTION pg_temp.reverse_txid(value BYTEA) RETURNS BYTEA LANGUAGE SQL IMMUTABLE STRICT AS $$
     SELECT decode(string_agg(substr(encode(value, 'hex'), i * 2 + 1, 2), '' ORDER BY i DESC), 'hex')
     FROM generate_series(0, octet_length(value) - 1) AS i
 $$;
+
 UPDATE wallet_withdrawal_transactions SET on_chain_txid = pg_temp.reverse_txid(on_chain_txid);
 UPDATE wallet_withdrawal_signatures SET on_chain_txid = pg_temp.reverse_txid(on_chain_txid);
 UPDATE wallet_withdrawal_transaction_inputs SET

@@ -12,7 +12,7 @@ use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::core::DynModuleConsensusItem;
-use fedimint_core::encoding::Encodable;
+use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::endpoint_constants::STATUS_ENDPOINT;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
@@ -257,7 +257,10 @@ impl FederationObserver {
             ),
             migration!("/schema/v9.sql"),
             migration!("/schema/v10.sql"),
-            migration!("/schema/v11.sql"),
+            migration_backfill!(
+                "/schema/v11.sql",
+                FederationObserver::backfill_peg_in_outpoints
+            ),
         ];
 
         ensure!(
@@ -359,6 +362,93 @@ impl FederationObserver {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    /// Rewrites every peg-in's outpoint from the stored transaction that
+    /// brought it in. Some older rows were stored in display byte order, a few
+    /// of them twice, and only the original transaction tells which is right.
+    async fn backfill_peg_in_outpoints(&self, dbtx: &Transaction<'_>) -> anyhow::Result<()> {
+        info!("Rewriting peg-in outpoints from their stored transactions");
+
+        // Read through the migration's transaction: dropping
+        // wallet_withdrawal_addresses locks the federations table it references
+        // until commit, so another connection would wait on us forever
+        for fed in query::<Federation>(dbtx, "SELECT * FROM federations", &[]).await? {
+            let decoders = decoders_from_config(&fed.config);
+            let rows = dbtx
+                .query(
+                    "SELECT p.on_chain_txid, p.on_chain_vout, p.in_index, t.data
+                     FROM wallet_peg_ins p
+                     JOIN transactions t ON t.federation_id = p.federation_id AND t.txid = p.txid
+                     WHERE p.federation_id = $1",
+                    &[&fed.federation_id.consensus_encode_to_vec()],
+                )
+                .await?;
+
+            let mut rewritten = 0;
+            for row in rows {
+                let stored_txid = row.get::<_, Vec<u8>>("on_chain_txid");
+                let stored_vout = row.get::<_, i32>("on_chain_vout");
+                let in_index = row.get::<_, i32>("in_index");
+                let transaction =
+                    match fedimint_core::transaction::Transaction::consensus_decode_whole(
+                        &row.get::<_, Vec<u8>>("data"),
+                        &decoders,
+                    ) {
+                        Ok(transaction) => transaction,
+                        Err(error) => {
+                            warn!("Skipping peg-in whose transaction cannot be decoded: {error}");
+                            continue;
+                        }
+                    };
+                let Some(outpoint) = transaction
+                    .inputs
+                    .get(in_index as usize)
+                    .and_then(|input| input.as_any().downcast_ref::<WalletInput>())
+                    .and_then(|input| match input {
+                        WalletInput::V0(peg_in_proof) => Some(peg_in_proof.outpoint()),
+                        WalletInput::V1(v1) => Some(v1.outpoint),
+                        WalletInput::Default { .. } => None,
+                    })
+                else {
+                    warn!("Skipping peg-in whose input {in_index} is not a known wallet input");
+                    continue;
+                };
+
+                let txid = outpoint.txid.to_byte_array().to_vec();
+                let vout = outpoint.vout as i32;
+                if txid == stored_txid && vout == stored_vout {
+                    continue;
+                }
+                // The peg-in may already be stored correctly, making this row a duplicate
+                let deleted = dbtx
+                    .execute(
+                        "DELETE FROM wallet_peg_ins
+                         WHERE on_chain_txid = $1 AND on_chain_vout = $2
+                           AND EXISTS (SELECT 1 FROM wallet_peg_ins WHERE on_chain_txid = $3 AND on_chain_vout = $4)",
+                        &[&stored_txid, &stored_vout, &txid, &vout],
+                    )
+                    .await?;
+                if deleted == 0 {
+                    dbtx.execute(
+                        "UPDATE wallet_peg_ins SET on_chain_txid = $3, on_chain_vout = $4
+                         WHERE on_chain_txid = $1 AND on_chain_vout = $2",
+                        &[&stored_txid, &stored_vout, &txid, &vout],
+                    )
+                    .await?;
+                }
+                rewritten += 1;
+            }
+            if rewritten > 0 {
+                info!(
+                    "Rewrote {rewritten} peg-in outpoints for federation {}",
+                    fed.federation_id
+                );
+            }
+        }
+
+        dbtx.execute("REFRESH MATERIALIZED VIEW utxos", &[]).await?;
         Ok(())
     }
 
