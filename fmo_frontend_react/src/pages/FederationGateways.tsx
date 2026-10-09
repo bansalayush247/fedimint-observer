@@ -75,7 +75,9 @@ function parseTimestamp(value?: string): Date | null {
 function getGatewayStatus(lastSeen: Date | null, now: number): GatewayStatus {
   if (!lastSeen) return 'unknown';
   const minutes = (now - lastSeen.getTime()) / (1000 * 60);
-  if (minutes <= 10) return 'online';
+  // Gateways are polled every 5 minutes and answers are cached for up to 6, so allow
+  // up to three polls before a healthy gateway stops counting as online
+  if (minutes <= 15) return 'online';
   if (minutes <= 30) return 'degraded';
   return 'offline';
 }
