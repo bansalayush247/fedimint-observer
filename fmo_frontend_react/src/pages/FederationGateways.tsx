@@ -12,13 +12,14 @@ import { readStorage, writeStorage } from '../utils/storage';
 import { useTheme } from '../hooks/useTheme';
 import type { EChartsOption } from 'echarts';
 
-type GatewayStatus = 'online' | 'degraded' | 'offline' | 'unknown';
+type GatewayStatus = 'online' | 'degraded' | 'offline' | 'unknown' | 'retired';
 type UptimeStripStatus = 'online' | 'degraded' | 'offline' | 'unknown';
 
 // The backend also accepts 1h, which is too short for its 5-minute polls
 const GATEWAY_WINDOWS = ['24h', '7d', '30d', '90d'] as const;
 type SelectableWindow = (typeof GATEWAY_WINDOWS)[number];
-const GATEWAY_FILTERS = ['all', 'online', 'degraded', 'offline', 'unknown'] as const;
+// 'all' means every active gateway; retired ones have their own filter
+const GATEWAY_FILTERS = ['all', 'online', 'degraded', 'offline', 'unknown', 'retired'] as const;
 const GATEWAY_SORTS = ['freshness', 'status', 'uptime', 'activity'] as const;
 type GatewaySort = (typeof GATEWAY_SORTS)[number];
 const SORT_DIRECTIONS = ['asc', 'desc'] as const;
@@ -41,11 +42,13 @@ const STALE_RETRY_MS = 2_500; // doubled after each stale answer
 const MAX_STALE_RETRIES = 4;
 const LIVE_LOOKUP_TIMEOUT_MS = 10_000;
 const EMPTY_TREND: GatewayUptimeTrendPoint[] = [];
+const RETIRED_AFTER_MINUTES = 7 * 24 * 60;
 const STATUS_RANK: Record<GatewayStatus, number> = {
   offline: 0,
   degraded: 1,
   unknown: 2,
   online: 3,
+  retired: 4,
 };
 
 interface GatewayWithStatus extends GatewayInfo {
@@ -79,6 +82,8 @@ function getGatewayStatus(lastSeen: Date | null, now: number): GatewayStatus {
   // up to three polls before a healthy gateway stops counting as online
   if (minutes <= 15) return 'online';
   if (minutes <= 30) return 'degraded';
+  // Gone from the registry for a week: it has left the federation (same rule as the backend)
+  if (minutes > RETIRED_AFTER_MINUTES) return 'retired';
   return 'offline';
 }
 
@@ -156,7 +161,7 @@ function getUptimeStripClass(status: UptimeStripStatus): string {
 function buildUptimeStrip(gateway: GatewayWithStatus, windowMinutes: number): UptimeStripStatus[] {
   const segments = 30;
 
-  if (gateway.status === 'unknown' || windowMinutes <= 0) {
+  if (gateway.status === 'unknown' || gateway.status === 'retired' || windowMinutes <= 0) {
     return Array.from({ length: segments }, () => 'unknown');
   }
 
@@ -753,34 +758,38 @@ export function FederationGateways() {
       });
   }, [gateways, now, windowMinutes]);
 
-  const totals = useMemo(() => {
-    const total = rows.length;
-    const online = rows.filter((row) => row.status === 'online').length;
-    const degraded = rows.filter((row) => row.status === 'degraded').length;
-    const offline = rows.filter((row) => row.status === 'offline').length;
-    const unknown = total - online - degraded - offline;
-    const vetted = rows.filter((row) => row.vetted).length;
+  // Retired gateways are listed separately and left out of every figure
+  const activeRows = useMemo(() => rows.filter((row) => row.status !== 'retired'), [rows]);
 
-    return { total, online, degraded, offline, unknown, vetted };
-  }, [rows]);
+  const totals = useMemo(() => {
+    const total = activeRows.length;
+    const online = activeRows.filter((row) => row.status === 'online').length;
+    const degraded = activeRows.filter((row) => row.status === 'degraded').length;
+    const offline = activeRows.filter((row) => row.status === 'offline').length;
+    const unknown = total - online - degraded - offline;
+    const vetted = activeRows.filter((row) => row.vetted).length;
+    const retired = rows.length - total;
+
+    return { total, online, degraded, offline, unknown, vetted, retired };
+  }, [activeRows, rows]);
 
   const avgUptime = useMemo(() => {
-    const observedRows = rows.filter((row) => row.coveragePct > 0);
+    const observedRows = activeRows.filter((row) => row.coveragePct > 0);
     if (observedRows.length === 0) return 0;
     const total = observedRows.reduce((sum, row) => sum + row.estimatedUptimePct, 0);
     return total / observedRows.length;
-  }, [rows]);
+  }, [activeRows]);
 
   const avgCoverage = useMemo(() => {
-    if (rows.length === 0) return 0;
-    const total = rows.reduce((sum, row) => sum + row.coveragePct, 0);
-    return total / rows.length;
-  }, [rows]);
+    if (activeRows.length === 0) return 0;
+    const total = activeRows.reduce((sum, row) => sum + row.coveragePct, 0);
+    return total / activeRows.length;
+  }, [activeRows]);
 
   const filteredRows = useMemo(() => {
     const query = gatewaySearch.trim().toLowerCase();
     const filtered = rows.filter((row) => (
-      (gatewayFilter === 'all' || row.status === gatewayFilter)
+      (gatewayFilter === 'all' ? row.status !== 'retired' : row.status === gatewayFilter)
       && (!query || row.searchText.includes(query))
     ));
 
@@ -913,7 +922,7 @@ export function FederationGateways() {
           </div>
         </div>
         {hasData && (
-          <div aria-busy={switchingWindow} className={`mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-sm transition-opacity dark:border-gray-700 ${switchingWindow ? 'opacity-60' : ''}`}><span className="font-semibold text-gray-950 dark:text-white">{totals.total} gateways</span><span className="text-green-700 dark:text-green-300">● {totals.online} online</span><span className="text-yellow-700 dark:text-yellow-300">● {totals.degraded} degraded</span><span className="text-red-700 dark:text-red-300">● {totals.offline} offline</span>{totals.unknown > 0 && <span className="text-gray-600 dark:text-gray-300">● {totals.unknown} unknown</span>}<span className="text-gray-600 dark:text-gray-300">{totals.vetted} vetted</span><span className="sm:ml-auto font-semibold text-indigo-700 dark:text-indigo-300">{avgCoverage > 0 ? <>{avgUptime.toFixed(1)}% uptime <span className="font-normal text-xs text-gray-500 dark:text-gray-400">({avgCoverage.toFixed(0)}% observed)</span></> : 'No uptime data'}</span></div>
+          <div aria-busy={switchingWindow} className={`mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-200 pt-3 text-sm transition-opacity dark:border-gray-700 ${switchingWindow ? 'opacity-60' : ''}`}><span className="font-semibold text-gray-950 dark:text-white">{totals.total} gateways</span><span className="text-green-700 dark:text-green-300">● {totals.online} online</span><span className="text-yellow-700 dark:text-yellow-300">● {totals.degraded} degraded</span><span className="text-red-700 dark:text-red-300">● {totals.offline} offline</span>{totals.unknown > 0 && <span className="text-gray-600 dark:text-gray-300">● {totals.unknown} unknown</span>}{totals.retired > 0 && <span className="text-gray-500 dark:text-gray-400">{totals.retired} retired</span>}<span className="text-gray-600 dark:text-gray-300">{totals.vetted} vetted</span><span className="sm:ml-auto font-semibold text-indigo-700 dark:text-indigo-300">{avgCoverage > 0 ? <>{avgUptime.toFixed(1)}% uptime <span className="font-normal text-xs text-gray-500 dark:text-gray-400">({avgCoverage.toFixed(0)}% observed)</span></> : 'No uptime data'}</span></div>
         )}
       </header>
 
@@ -946,7 +955,7 @@ export function FederationGateways() {
       <section aria-busy={switchingWindow} className={`mb-4 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-md transition-opacity dark:border-gray-700 dark:bg-gray-800 ${switchingWindow ? 'opacity-60' : ''}`}>
         <div className="border-b border-gray-200 p-4 dark:border-gray-700 sm:p-5">
           <div className="flex flex-col justify-between gap-3 lg:flex-row lg:items-end"><div><h2 className="text-lg font-semibold text-gray-950 dark:text-white">Gateway directory</h2><p className="mt-1 text-sm text-gray-500 dark:text-gray-400">{filteredRows.length} of {rows.length} gateways · every row includes its 30-bucket availability strip, ordered oldest to newest.</p></div><div className="flex flex-col gap-2 sm:flex-row"><input value={gatewaySearch} onChange={(event) => setGatewaySearch(event.target.value)} aria-label="Search gateways" placeholder="Search gateway, node, endpoint" className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-900 dark:text-white" /><select value={gatewaySort} onChange={(event) => { const nextSort = event.target.value as GatewaySort; updateView({ sort: nextSort === 'freshness' ? null : nextSort, dir: null }); }} aria-label="Sort gateways" className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"><option value="freshness">Last seen</option><option value="status">Status</option><option value="uptime">Uptime</option><option value="activity">Activity</option></select><button type="button" onClick={() => { const nextDirection = sortDirection === 'asc' ? 'desc' : 'asc'; updateView({ dir: nextDirection === defaultDirection(gatewaySort) ? null : nextDirection }); }} className="rounded-lg border border-blue-300 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-200" title={`Sort ${sortDirection === 'asc' ? 'ascending' : 'descending'}`}>{sortDirection === 'asc' ? '↑ Asc' : '↓ Desc'}</button></div></div>
-          <div className="mt-3 flex flex-wrap gap-2 pb-1" role="group" aria-label="Filter by status">{GATEWAY_FILTERS.map((filter) => <button key={filter} type="button" aria-pressed={gatewayFilter === filter} onClick={() => updateView({ status: filter === 'all' ? null : filter })} className={`whitespace-nowrap rounded-full border px-3 py-1.5 text-xs font-medium capitalize ${gatewayFilter === filter ? 'border-blue-600 bg-blue-600 text-white' : 'border-gray-300 text-gray-600 dark:border-gray-600 dark:text-gray-300'}`}>{filter} ({filter === 'all' ? totals.total : totals[filter]})</button>)}</div>
+          <div className="mt-3 flex flex-wrap gap-2 pb-1" role="group" aria-label="Filter by status">{GATEWAY_FILTERS.map((filter) => <button key={filter} type="button" aria-pressed={gatewayFilter === filter} onClick={() => updateView({ status: filter === 'all' ? null : filter })} className={`whitespace-nowrap rounded-full border px-3 py-1.5 text-xs font-medium capitalize ${gatewayFilter === filter ? 'border-blue-600 bg-blue-600 text-white' : 'border-gray-300 text-gray-600 dark:border-gray-600 dark:text-gray-300'}`}>{filter === 'all' ? 'All active' : filter} ({filter === 'all' ? totals.total : totals[filter]})</button>)}</div>
           <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400"><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-green-500" />Online</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-yellow-500" />Degraded</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-red-500" />Offline</span><span><i className="mr-1 inline-block h-2 w-2 rounded-sm bg-gray-300 dark:bg-gray-600" />Unknown</span></div>
         </div>
         {/* Phones get one stacked card per gateway instead of a 960px table behind a sideways scroll */}
@@ -972,7 +981,11 @@ export function FederationGateways() {
             {filteredRows.length === 0 && (
               <tr className="block bg-white border-b dark:bg-gray-800 dark:border-gray-700 sm:table-row">
                 <td colSpan={5} className="block px-4 sm:px-6 py-6 text-center text-gray-500 dark:text-gray-400 sm:table-cell">
-                  {rows.length === 0 ? 'No gateways to show.' : 'No gateways match these filters.'}
+                  {gatewayFilter !== 'all' || gatewaySearch.trim()
+                    ? 'No gateways match these filters.'
+                    : totals.retired > 0
+                      ? `No active gateways. ${totals.retired} retired ${totals.retired === 1 ? 'one is' : 'ones are'} under the Retired filter.`
+                      : 'No gateways to show.'}
                 </td>
               </tr>
             )}
