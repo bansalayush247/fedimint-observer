@@ -328,7 +328,7 @@ impl FederationObserver {
                  SELECT g.gateway_id, FALSE AS is_seen
                  FROM gateways g
                  WHERE g.federation_id = $1
-                   AND g.last_seen >= $2 - make_interval(days => $4)
+                   AND g.last_seen >= $2::timestamptz - make_interval(days => $4)
                    AND NOT EXISTS (
                        SELECT 1
                        FROM current_gateway_ids c
