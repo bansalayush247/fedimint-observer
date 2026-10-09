@@ -25,6 +25,10 @@ use crate::util::query;
 const GATEWAY_POLL_INTERVAL_MINUTES: u64 = 5;
 const GATEWAY_SNAPSHOT_RETENTION_DAYS: i64 = 90;
 const GATEWAY_PRUNE_INTERVAL_HOURS: i64 = 6;
+// A gateway missing from the registry this long has left the federation: it
+// gets no more "not seen" samples, and later ones don't count against uptime or
+// the trend
+const GATEWAY_RETIRED_AFTER_DAYS: i32 = 7;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum GatewayMetricsWindow {
@@ -324,6 +328,7 @@ impl FederationObserver {
                  SELECT g.gateway_id, FALSE AS is_seen
                  FROM gateways g
                  WHERE g.federation_id = $1
+                   AND g.last_seen >= $2 - make_interval(days => $4)
                    AND NOT EXISTS (
                        SELECT 1
                        FROM current_gateway_ids c
@@ -339,7 +344,12 @@ impl FederationObserver {
                  a.is_seen
              FROM all_gateway_ids a
              ON CONFLICT DO NOTHING",
-            &[&federation_id_bytes, &now, &gateway_ids],
+            &[
+                &federation_id_bytes,
+                &now,
+                &gateway_ids,
+                &GATEWAY_RETIRED_AFTER_DAYS,
+            ],
         )
         .await?;
 
@@ -416,9 +426,12 @@ impl FederationObserver {
         )
         .await?;
 
+        // NOT MATERIALIZED lets the planner see real row counts through the CTEs;
+        // materialized, it estimated one row each and nested-looped ~10k x 10k
+        // rows (90D: 55 s instead of 4 s)
         let activity_rows = query::<GatewayActivityRow>(
             &conn,
-            "WITH tx_window AS (
+            "WITH tx_window AS NOT MATERIALIZED (
                      SELECT t.federation_id, t.txid
                      FROM transactions t
                      JOIN session_times st
@@ -427,7 +440,7 @@ impl FederationObserver {
                      WHERE t.federation_id = $1
                        AND st.estimated_session_timestamp >= $2
                  ),
-                 window_ln_outputs AS (
+                 window_ln_outputs AS NOT MATERIALIZED (
                      SELECT
                          o.federation_id,
                          o.txid,
@@ -443,7 +456,7 @@ impl FederationObserver {
                        AND o.kind = 'ln'
                        AND o.ln_contract_id IS NOT NULL
                  ),
-                 window_ln_inputs AS (
+                 window_ln_inputs AS NOT MATERIALIZED (
                      SELECT
                          i.federation_id,
                          i.txid,
@@ -456,7 +469,7 @@ impl FederationObserver {
                        AND i.kind = 'ln'
                        AND i.ln_contract_id IS NOT NULL
                  ),
-                 contract_map AS (
+                 contract_map AS NOT MATERIALIZED (
                      SELECT DISTINCT ON (wlo.federation_id, wlo.ln_contract_id)
                          wlo.federation_id,
                          wlo.ln_contract_id,
@@ -539,14 +552,20 @@ impl FederationObserver {
         let uptime_rows = query::<GatewayUptimeRow>(
             &conn,
             "SELECT
-                 gateway_id,
-                 COUNT(*) FILTER (WHERE is_seen)::bigint AS seen_samples,
+                 s.gateway_id,
+                 COUNT(*) FILTER (WHERE s.is_seen)::bigint AS seen_samples,
                  COUNT(*)::bigint AS total_samples
-             FROM gateway_poll_snapshots
-             WHERE federation_id = $1
-               AND poll_time >= $2
-             GROUP BY gateway_id",
-            &[&federation_id_bytes, &window_start_utc],
+             FROM gateway_poll_snapshots s
+             JOIN gateways g ON g.federation_id = s.federation_id AND g.gateway_id = s.gateway_id
+             WHERE s.federation_id = $1
+               AND s.poll_time >= $2
+               AND s.poll_time <= g.last_seen + make_interval(days => $3)
+             GROUP BY s.gateway_id",
+            &[
+                &federation_id_bytes,
+                &window_start_utc,
+                &GATEWAY_RETIRED_AFTER_DAYS,
+            ],
         )
         .await?;
 
@@ -627,15 +646,21 @@ impl FederationObserver {
         let rows = query::<TrendRow>(
             &conn,
             "SELECT
-                 date_trunc('day', poll_time) AS day,
-                 COUNT(*) FILTER (WHERE is_seen)::bigint AS seen_samples,
+                 date_trunc('day', s.poll_time) AS day,
+                 COUNT(*) FILTER (WHERE s.is_seen)::bigint AS seen_samples,
                  COUNT(*)::bigint AS total_samples
-             FROM gateway_poll_snapshots
-             WHERE federation_id = $1
-               AND poll_time >= $2
-             GROUP BY date_trunc('day', poll_time)
+             FROM gateway_poll_snapshots s
+             JOIN gateways g ON g.federation_id = s.federation_id AND g.gateway_id = s.gateway_id
+             WHERE s.federation_id = $1
+               AND s.poll_time >= $2
+               AND s.poll_time <= g.last_seen + make_interval(days => $3)
+             GROUP BY date_trunc('day', s.poll_time)
              ORDER BY day ASC",
-            &[&federation_id_bytes, &window_start],
+            &[
+                &federation_id_bytes,
+                &window_start,
+                &GATEWAY_RETIRED_AFTER_DAYS,
+            ],
         )
         .await?;
 
