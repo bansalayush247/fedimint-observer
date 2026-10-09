@@ -2,7 +2,7 @@ import type {
   FedimintTotals,
   FederationSummary,
   GatewayInfo,
-  GatewayUptimeTrendPoint,
+  GatewayOverview,
   GatewayWindow,
 } from '../types/api';
 
@@ -33,28 +33,12 @@ export const api = {
     return response.json();
   },
 
-  async getFederationGateways(
-    id: string,
-    window: GatewayWindow,
-    signal?: AbortSignal,
-  ): Promise<CachedResponse<GatewayInfo[]>> {
-    return fetchCached(
-      `${BASE_URL}/federations/${id}/gateways?window=${encodeURIComponent(window)}`,
-      'Failed to fetch gateways',
-      signal,
-    );
-  },
-
-  async getFederationGatewayUptimeTrend(
-    id: string,
-    window: GatewayWindow,
-    signal?: AbortSignal,
-  ): Promise<CachedResponse<GatewayUptimeTrendPoint[]>> {
-    return fetchCached(
-      `${BASE_URL}/federations/${id}/gateways/uptime-trend?window=${encodeURIComponent(window)}`,
-      'Failed to fetch the gateway uptime trend',
-      signal,
-    );
+  async getFederationGatewayOverview(id: string, window: GatewayWindow, signal?: AbortSignal): Promise<GatewayOverview> {
+    const response = await fetch(`${BASE_URL}/federations/${id}/gateways/overview?window=${encodeURIComponent(window)}`, { signal });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch gateways (${response.status})`);
+    }
+    return response.json();
   },
 
   async getFederationGatewaysByInvite(inviteCode: string, signal?: AbortSignal): Promise<GatewayInfo[]> {
@@ -66,19 +50,3 @@ export const api = {
     return response.json();
   },
 };
-
-export interface CachedResponse<T> {
-  data: T;
-  // Nginx answered from an expired cache entry and is refreshing it in the background
-  stale: boolean;
-}
-
-async function fetchCached<T>(url: string, errorMessage: string, signal?: AbortSignal): Promise<CachedResponse<T>> {
-  const response = await fetch(url, { signal });
-  if (!response.ok) {
-    throw new Error(`${errorMessage} (${response.status})`);
-  }
-  // Only readable on the same origin, which is how the site is served
-  const cacheStatus = response.headers.get('X-Cache-Status');
-  return { data: await response.json(), stale: cacheStatus === 'STALE' || cacheStatus === 'UPDATING' };
-}

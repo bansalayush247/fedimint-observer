@@ -35,11 +35,9 @@ const WINDOW_MINUTES: Record<SelectableWindow, number> = {
   '30d': 30 * 24 * 60,
   '90d': 90 * 24 * 60,
 };
-// Gateways are polled every 5 minutes and Nginx caches answers for 6
+// Gateways are polled and their overview rebuilt every 5 minutes on the server
 const REFRESH_INTERVAL_MS = 60_000;
 const REFRESH_CHECK_MS = 10_000;
-const STALE_RETRY_MS = 2_500; // doubled after each stale answer
-const MAX_STALE_RETRIES = 4;
 const LIVE_LOOKUP_TIMEOUT_MS = 10_000;
 const EMPTY_TREND: GatewayUptimeTrendPoint[] = [];
 const RETIRED_AFTER_MINUTES = 7 * 24 * 60;
@@ -78,7 +76,7 @@ function parseTimestamp(value?: string): Date | null {
 function getGatewayStatus(lastSeen: Date | null, now: number): GatewayStatus {
   if (!lastSeen) return 'unknown';
   const minutes = (now - lastSeen.getTime()) / (1000 * 60);
-  // Gateways are polled every 5 minutes and answers are cached for up to 6, so allow
+  // Gateways are polled every 5 minutes and the overview is rebuilt every 5, so allow
   // up to three polls before a healthy gateway stops counting as online
   if (minutes <= 15) return 'online';
   if (minutes <= 30) return 'degraded';
@@ -458,8 +456,6 @@ export function FederationGateways() {
   const [live, setLive] = useState<LiveLookup>({ status: 'pending' });
   const [liveKey, setLiveKey] = useState(0);
   const [trend, setTrend] = useState<{ window: SelectableWindow; points: GatewayUptimeTrendPoint[] } | null>(null);
-  const [trendFailed, setTrendFailed] = useState(false);
-  const [trendLoading, setTrendLoading] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [reloadKey, setReloadKey] = useState(0); // Try again
@@ -469,8 +465,6 @@ export function FederationGateways() {
   const [rawAnnouncement, setRawAnnouncement] = useState<RawAnnouncementDialog | null>(null);
   const loadInFlight = useRef(false);
   const lastLoadAt = useRef(0); // when the last load finished
-  const staleAttempts = useRef(0);
-  const staleScope = useRef('');
   const focusAfterRetry = useRef(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
 
@@ -518,72 +512,35 @@ export function FederationGateways() {
   useEffect(() => {
     const controller = new AbortController();
     const { signal } = controller;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    // A new window or a Try again starts over with the stale retries
-    const scope = `${timeWindow}:${reloadKey}`;
-    if (staleScope.current !== scope) {
-      staleScope.current = scope;
-      staleAttempts.current = 0;
-    }
     loadInFlight.current = true;
     setObservedLoading(true);
-    setTrendLoading(true);
 
-    const gatewaysRequest = api.getFederationGateways(id, timeWindow, signal).then(
-      ({ data, stale }) => {
-        if (signal.aborted) return false;
-        setObserved({ window: timeWindow, gateways: data });
+    // The table and the trend come in one answer, so they always describe the same moment
+    api.getFederationGatewayOverview(id, timeWindow, signal)
+      .then((overview) => {
+        if (signal.aborted) return;
+        setObserved({ window: timeWindow, gateways: overview.gateways ?? [] });
+        setTrend({ window: timeWindow, points: overview.uptime_trend ?? [] });
         setObservedError(null);
-        // An expired cache entry is old data, so it does not count as an update
-        if (!stale) setUpdatedAt(Date.now());
-        setObservedLoading(false);
-        return stale;
-      },
-      (err: unknown) => {
-        if (signal.aborted) return false;
+        setUpdatedAt(Date.parse(overview.computed_at));
+      })
+      .catch((err: unknown) => {
+        if (signal.aborted) return;
         setObservedError({
           window: timeWindow,
           message: errorMessage(err, 'Failed to fetch gateways'),
           network: err instanceof TypeError,
         });
+      })
+      .finally(() => {
+        if (signal.aborted) return;
         setObservedLoading(false);
-        return false;
-      },
-    );
-    const trendRequest = api.getFederationGatewayUptimeTrend(id, timeWindow, signal).then(
-      ({ data, stale }) => {
-        if (signal.aborted) return false;
-        setTrend({ window: timeWindow, points: data });
-        setTrendFailed(false);
-        setTrendLoading(false);
-        return stale;
-      },
-      () => {
-        if (signal.aborted) return false;
-        setTrendFailed(true);
-        setTrendLoading(false);
-        return false;
-      },
-    );
-
-    void Promise.all([gatewaysRequest, trendRequest]).then((staleness) => {
-      if (signal.aborted) return;
-      loadInFlight.current = false;
-      lastLoadAt.current = Date.now();
-      if (!staleness.some(Boolean)) {
-        staleAttempts.current = 0;
-        return;
-      }
-      // Nginx answered from an expired entry while it rebuilds it in the background,
-      // which takes up to ~20 s for 90D, so ask again with a growing delay
-      if (staleAttempts.current >= MAX_STALE_RETRIES) return;
-      retryTimer = setTimeout(() => setRefreshKey((key) => key + 1), STALE_RETRY_MS * 2 ** staleAttempts.current);
-      staleAttempts.current += 1;
-    });
+        loadInFlight.current = false;
+        lastLoadAt.current = Date.now();
+      });
 
     return () => {
       controller.abort();
-      clearTimeout(retryTimer);
       loadInFlight.current = false;
     };
   }, [id, timeWindow, reloadKey, refreshKey]);
@@ -880,9 +837,9 @@ export function FederationGateways() {
   const switchingWindow = observed !== null && dataWindow !== timeWindow && observedLoading;
   const trendPlaceholder = trend?.window === timeWindow
     ? 'No gateway poll history is available for this window.'
-    : trendLoading
+    : observedLoading
       ? 'Loading availability trend…'
-      : trendFailed ? 'The availability trend could not be loaded.' : '';
+      : currentError ? 'The availability trend could not be loaded.' : '';
   const windowStatus = observedLoading && (observed === null || dataWindow !== timeWindow)
     ? `Loading ${timeWindow.toUpperCase()}…`
     : observed === null

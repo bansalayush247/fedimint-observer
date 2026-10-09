@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use axum::extract::{Path, Query, State};
@@ -13,7 +14,8 @@ use fedimint_core::module::ApiRequestErased;
 use fedimint_ln_common::federation_endpoint_constants::LIST_GATEWAYS_ENDPOINT;
 use fedimint_ln_common::LightningGatewayAnnouncement;
 use fmo_api_types::{
-    GatewayActivityMetrics, GatewayInfo, GatewayUptimeMetrics, GatewayUptimeTrendPoint,
+    GatewayActivityMetrics, GatewayInfo, GatewayOverview, GatewayUptimeMetrics,
+    GatewayUptimeTrendPoint,
 };
 use futures::future::join_all;
 use serde::Deserialize;
@@ -29,9 +31,16 @@ const GATEWAY_PRUNE_INTERVAL_HOURS: i64 = 6;
 // gets no more "not seen" samples, and later ones don't count against uptime or
 // the trend
 const GATEWAY_RETIRED_AFTER_DAYS: i32 = 7;
+// Matches the poll interval, so an overview is never more than one poll behind
+const GATEWAY_OVERVIEW_REFRESH_MINUTES: u64 = 5;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum GatewayMetricsWindow {
+/// Overviews for every federation and window, rebuilt in the background so
+/// requests never wait for the queries (90D takes seconds)
+pub(crate) type GatewayOverviewCache =
+    Arc<RwLock<HashMap<(FederationId, GatewayMetricsWindow), Arc<GatewayOverview>>>>;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub(crate) enum GatewayMetricsWindow {
     H1,
     H24,
     D7,
@@ -40,6 +49,9 @@ enum GatewayMetricsWindow {
 }
 
 impl GatewayMetricsWindow {
+    // The page's default window first, so it is ready soonest after a restart
+    const ALL: [Self; 5] = [Self::D7, Self::H24, Self::D30, Self::D90, Self::H1];
+
     fn parse(value: Option<&str>) -> anyhow::Result<Self> {
         match value.unwrap_or("7d") {
             "1h" => Ok(Self::H1),
@@ -77,6 +89,8 @@ impl GatewayMetricsWindow {
 #[derive(Debug, Deserialize)]
 pub(super) struct GetFederationGatewaysParams {
     window: Option<String>,
+    /// Comma-separated parts to return: `gateways`, `trend`. Both by default.
+    include: Option<String>,
 }
 
 pub(crate) async fn fetch_gateways_for_config(
@@ -377,10 +391,95 @@ impl FederationObserver {
         Ok(())
     }
 
+    /// Background task: rebuild every federation's gateway overviews. Runs in
+    /// a loop until cancelled.
+    pub(crate) async fn refresh_gateway_overviews(self) {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(GATEWAY_OVERVIEW_REFRESH_MINUTES * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let start = Instant::now();
+            let federations = match self.list_federations().await {
+                Ok(federations) => federations,
+                Err(e) => {
+                    warn!("Failed to list federations for gateway overviews: {e:?}");
+                    continue;
+                }
+            };
+            // One query at a time keeps the load on the database steady
+            for window in GatewayMetricsWindow::ALL {
+                for federation in &federations {
+                    let federation_id = federation.federation_id;
+                    match self.compute_gateway_overview(federation_id, window).await {
+                        Ok(overview) => {
+                            self.gateway_overviews()
+                                .write()
+                                .expect("gateway overview lock poisoned")
+                                .insert((federation_id, window), Arc::new(overview));
+                        }
+                        Err(e) => warn!(
+                            "Failed to compute {} gateway overview for {}: {e:?}",
+                            window.label(),
+                            federation_id
+                        ),
+                    }
+                }
+            }
+            info!(
+                "Gateway overviews refreshed in {:.2}s",
+                start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    async fn gateway_overview(
+        &self,
+        federation_id: FederationId,
+        window: GatewayMetricsWindow,
+    ) -> anyhow::Result<Arc<GatewayOverview>> {
+        let cached = self
+            .gateway_overviews()
+            .read()
+            .expect("gateway overview lock poisoned")
+            .get(&(federation_id, window))
+            .cloned();
+        // Only right after a restart, or for a federation added since the last
+        // refresh. Not cached here, so unknown IDs can't grow the cache.
+        match cached {
+            Some(overview) => Ok(overview),
+            None => Ok(Arc::new(
+                self.compute_gateway_overview(federation_id, window).await?,
+            )),
+        }
+    }
+
+    async fn compute_gateway_overview(
+        &self,
+        federation_id: FederationId,
+        window: GatewayMetricsWindow,
+    ) -> anyhow::Result<GatewayOverview> {
+        let computed_at = Utc::now();
+        let window_start = computed_at - window.duration();
+        Ok(GatewayOverview {
+            window: window.label().to_owned(),
+            computed_at,
+            gateways: Some(
+                self.list_federation_gateways(federation_id, window, window_start)
+                    .await?,
+            ),
+            uptime_trend: Some(
+                self.federation_gateway_uptime_trend(federation_id, window_start)
+                    .await?,
+            ),
+        })
+    }
+
     async fn list_federation_gateways(
         &self,
         federation_id: FederationId,
         window: GatewayMetricsWindow,
+        window_start_utc: DateTime<Utc>,
     ) -> anyhow::Result<Vec<GatewayInfo>> {
         #[derive(postgres_from_row::FromRow)]
         struct GatewayRow {
@@ -412,7 +511,6 @@ impl FederationObserver {
 
         let conn = self.connection().await?;
         let federation_id_bytes = federation_id.consensus_encode_to_vec();
-        let window_start_utc: DateTime<Utc> = Utc::now() - window.duration();
         let window_start_naive = window_start_utc.naive_utc();
         let metrics_window = window.label().to_owned();
 
@@ -631,7 +729,7 @@ impl FederationObserver {
     async fn federation_gateway_uptime_trend(
         &self,
         federation_id: FederationId,
-        window: GatewayMetricsWindow,
+        window_start: DateTime<Utc>,
     ) -> anyhow::Result<Vec<GatewayUptimeTrendPoint>> {
         #[derive(postgres_from_row::FromRow)]
         struct TrendRow {
@@ -642,7 +740,6 @@ impl FederationObserver {
 
         let conn = self.connection().await?;
         let federation_id_bytes = federation_id.consensus_encode_to_vec();
-        let window_start = Utc::now() - window.duration();
         let rows = query::<TrendRow>(
             &conn,
             "SELECT
@@ -685,28 +782,44 @@ impl FederationObserver {
     }
 }
 
-pub(super) async fn get_federation_gateways(
-    Path(federation_id): Path<FederationId>,
-    Query(params): Query<GetFederationGatewaysParams>,
-    State(state): State<crate::AppState>,
-) -> crate::error::Result<Json<Vec<GatewayInfo>>> {
-    let window = GatewayMetricsWindow::parse(params.window.as_deref())?;
-    Ok(state
-        .federation_observer
-        .list_federation_gateways(federation_id, window)
-        .await?
-        .into())
+/// Which parts of the overview to return, as (gateways, trend)
+fn parse_overview_include(include: Option<&str>) -> anyhow::Result<(bool, bool)> {
+    let Some(include) = include else {
+        return Ok((true, true));
+    };
+    let (mut gateways, mut trend) = (false, false);
+    for part in include.split(',').map(str::trim) {
+        match part {
+            "gateways" => gateways = true,
+            "trend" => trend = true,
+            invalid => {
+                bail!("Invalid include '{invalid}'. Supported values: gateways, trend")
+            }
+        }
+    }
+    Ok((gateways, trend))
 }
 
-pub(super) async fn get_federation_gateway_uptime_trend(
+pub(super) async fn get_federation_gateway_overview(
     Path(federation_id): Path<FederationId>,
     Query(params): Query<GetFederationGatewaysParams>,
     State(state): State<crate::AppState>,
-) -> crate::error::Result<Json<Vec<GatewayUptimeTrendPoint>>> {
+) -> crate::error::Result<Json<GatewayOverview>> {
     let window = GatewayMetricsWindow::parse(params.window.as_deref())?;
-    Ok(state
+    let (include_gateways, include_trend) = parse_overview_include(params.include.as_deref())?;
+    let overview = state
         .federation_observer
-        .federation_gateway_uptime_trend(federation_id, window)
-        .await?
-        .into())
+        .gateway_overview(federation_id, window)
+        .await?;
+    // Only the requested parts are copied out of the shared cached overview
+    Ok(Json(GatewayOverview {
+        window: overview.window.clone(),
+        computed_at: overview.computed_at,
+        gateways: include_gateways
+            .then(|| overview.gateways.clone())
+            .flatten(),
+        uptime_trend: include_trend
+            .then(|| overview.uptime_trend.clone())
+            .flatten(),
+    }))
 }
