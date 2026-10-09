@@ -33,34 +33,52 @@ export const api = {
     return response.json();
   },
 
-  async getFederationGateways(id: string, window?: GatewayWindow): Promise<GatewayInfo[]> {
-    const query = window ? `?window=${encodeURIComponent(window)}` : '';
-    const response = await fetch(`${BASE_URL}/federations/${id}/gateways${query}`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch gateways for federation ${id} (${response.status})`);
-    }
-    return response.json();
+  async getFederationGateways(
+    id: string,
+    window: GatewayWindow,
+    signal?: AbortSignal,
+  ): Promise<CachedResponse<GatewayInfo[]>> {
+    return fetchCached(
+      `${BASE_URL}/federations/${id}/gateways?window=${encodeURIComponent(window)}`,
+      'Failed to fetch gateways',
+      signal,
+    );
   },
 
   async getFederationGatewayUptimeTrend(
     id: string,
     window: GatewayWindow,
-  ): Promise<GatewayUptimeTrendPoint[]> {
-    const response = await fetch(
+    signal?: AbortSignal,
+  ): Promise<CachedResponse<GatewayUptimeTrendPoint[]>> {
+    return fetchCached(
       `${BASE_URL}/federations/${id}/gateways/uptime-trend?window=${encodeURIComponent(window)}`,
+      'Failed to fetch the gateway uptime trend',
+      signal,
     );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch gateway uptime trend (${response.status})`);
-    }
-    return response.json();
   },
 
-  async getFederationGatewaysByInvite(inviteCode: string): Promise<GatewayInfo[]> {
+  async getFederationGatewaysByInvite(inviteCode: string, signal?: AbortSignal): Promise<GatewayInfo[]> {
     const encodedInvite = encodeURIComponent(inviteCode);
-    const response = await fetch(`${BASE_URL}/config/${encodedInvite}/gateways`);
+    const response = await fetch(`${BASE_URL}/config/${encodedInvite}/gateways`, { signal });
     if (!response.ok) {
       throw new Error(`Failed to fetch gateways by invite (${response.status})`);
     }
     return response.json();
   },
 };
+
+export interface CachedResponse<T> {
+  data: T;
+  // Nginx answered from an expired cache entry and is refreshing it in the background
+  stale: boolean;
+}
+
+async function fetchCached<T>(url: string, errorMessage: string, signal?: AbortSignal): Promise<CachedResponse<T>> {
+  const response = await fetch(url, { signal });
+  if (!response.ok) {
+    throw new Error(`${errorMessage} (${response.status})`);
+  }
+  // Only readable on the same origin, which is how the site is served
+  const cacheStatus = response.headers.get('X-Cache-Status');
+  return { data: await response.json(), stale: cacheStatus === 'STALE' || cacheStatus === 'UPDATING' };
+}
