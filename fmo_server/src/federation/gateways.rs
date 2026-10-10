@@ -31,8 +31,9 @@ const GATEWAY_PRUNE_INTERVAL_HOURS: i64 = 6;
 // gets no more "not seen" samples, and later ones don't count against uptime or
 // the trend
 const GATEWAY_RETIRED_AFTER_DAYS: i32 = 7;
-// Matches the poll interval, so an overview is never more than one poll behind
-const GATEWAY_OVERVIEW_REFRESH_MINUTES: u64 = 5;
+// Matches the poll interval, so short windows are never more than one poll
+// behind; longer windows refresh every few ticks (see refresh_every_ticks)
+const GATEWAY_OVERVIEW_TICK_MINUTES: u64 = 5;
 
 /// Overviews for every federation and window, rebuilt in the background so
 /// requests never wait for the queries (90D takes seconds)
@@ -41,7 +42,6 @@ pub(crate) type GatewayOverviewCache =
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub(crate) enum GatewayMetricsWindow {
-    H1,
     H24,
     D7,
     D30,
@@ -50,24 +50,22 @@ pub(crate) enum GatewayMetricsWindow {
 
 impl GatewayMetricsWindow {
     // The page's default window first, so it is ready soonest after a restart
-    const ALL: [Self; 5] = [Self::D7, Self::H24, Self::D30, Self::D90, Self::H1];
+    const ALL: [Self; 4] = [Self::D7, Self::H24, Self::D30, Self::D90];
 
     fn parse(value: Option<&str>) -> anyhow::Result<Self> {
         match value.unwrap_or("7d") {
-            "1h" => Ok(Self::H1),
             "24h" => Ok(Self::H24),
             "7d" => Ok(Self::D7),
             "30d" => Ok(Self::D30),
             "90d" => Ok(Self::D90),
-            invalid => bail!(
-                "Invalid gateways window '{invalid}'. Supported values: 1h, 24h, 7d, 30d, 90d"
-            ),
+            invalid => {
+                bail!("Invalid gateways window '{invalid}'. Supported values: 24h, 7d, 30d, 90d")
+            }
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::H1 => "1h",
             Self::H24 => "24h",
             Self::D7 => "7d",
             Self::D30 => "30d",
@@ -77,11 +75,21 @@ impl GatewayMetricsWindow {
 
     fn duration(self) -> chrono::Duration {
         match self {
-            Self::H1 => chrono::Duration::hours(1),
             Self::H24 => chrono::Duration::hours(24),
             Self::D7 => chrono::Duration::days(7),
             Self::D30 => chrono::Duration::days(30),
             Self::D90 => chrono::Duration::days(90),
+        }
+    }
+
+    /// How many overview ticks pass between refreshes. Five more minutes
+    /// barely move a 30- or 90-day figure, and those windows run the heaviest
+    /// queries.
+    fn refresh_every_ticks(self) -> u64 {
+        match self {
+            Self::H24 | Self::D7 => 1,
+            Self::D30 => 6,
+            Self::D90 => 12,
         }
     }
 }
@@ -395,11 +403,18 @@ impl FederationObserver {
     /// a loop until cancelled.
     pub(crate) async fn refresh_gateway_overviews(self) {
         let mut interval =
-            tokio::time::interval(Duration::from_secs(GATEWAY_OVERVIEW_REFRESH_MINUTES * 60));
+            tokio::time::interval(Duration::from_secs(GATEWAY_OVERVIEW_TICK_MINUTES * 60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Tick 0 builds every window, so all are ready right after a restart
+        let mut tick: u64 = 0;
         loop {
             interval.tick().await;
             let start = Instant::now();
+            let windows: Vec<GatewayMetricsWindow> = GatewayMetricsWindow::ALL
+                .into_iter()
+                .filter(|window| tick.is_multiple_of(window.refresh_every_ticks()))
+                .collect();
+            tick += 1;
             let federations = match self.list_federations().await {
                 Ok(federations) => federations,
                 Err(e) => {
@@ -408,7 +423,7 @@ impl FederationObserver {
                 }
             };
             // One query at a time keeps the load on the database steady
-            for window in GatewayMetricsWindow::ALL {
+            for &window in &windows {
                 for federation in &federations {
                     let federation_id = federation.federation_id;
                     match self.compute_gateway_overview(federation_id, window).await {
@@ -427,8 +442,13 @@ impl FederationObserver {
                 }
             }
             info!(
-                "Gateway overviews refreshed in {:.2}s",
-                start.elapsed().as_secs_f64()
+                "Gateway overviews refreshed in {:.2}s ({})",
+                start.elapsed().as_secs_f64(),
+                windows
+                    .iter()
+                    .map(|window| window.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
     }
