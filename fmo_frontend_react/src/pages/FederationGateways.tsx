@@ -15,7 +15,6 @@ import type { EChartsOption } from 'echarts';
 type GatewayStatus = 'online' | 'degraded' | 'offline' | 'unknown' | 'retired';
 type UptimeStripStatus = 'online' | 'degraded' | 'offline' | 'unknown';
 
-// The backend also accepts 1h, which is too short for its 5-minute polls
 const GATEWAY_WINDOWS = ['24h', '7d', '30d', '90d'] as const;
 type SelectableWindow = (typeof GATEWAY_WINDOWS)[number];
 // 'all' means every active gateway; retired ones have their own filter
