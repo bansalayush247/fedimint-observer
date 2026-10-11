@@ -7,6 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
+use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::Encodable;
@@ -102,18 +103,16 @@ pub(super) struct GetFederationGatewaysParams {
 }
 
 pub(crate) async fn fetch_gateways_for_config(
+    connectors: &ConnectorRegistry,
     config: &ClientConfig,
 ) -> anyhow::Result<Vec<GatewayInfo>> {
-    let connectors = fedimint_connectors::ConnectorRegistry::build_from_client_env()?
-        .bind()
-        .await?;
     let peers = config
         .global
         .api_endpoints
         .iter()
         .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
         .collect();
-    let api = DynGlobalApi::new(connectors, peers, None)?;
+    let api = DynGlobalApi::new(connectors.clone(), peers, None)?;
 
     let ln_instance_id = config
         .modules
