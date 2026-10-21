@@ -87,7 +87,7 @@
             # Get the npm dependencies hash
             # To update: nix build .#fmo_frontend_react_default --impure
             # and use the hash from the error message
-            npmDepsHash = "sha256-HHHlCV6gXVbdKvAT1aFIGCYx+KFigUqUoAGwyOEoel0=";
+            npmDepsHash = "sha256-2yGPNYrCGrKkNMu1T5M6vU1ReYYEwzKpPh1acBqG4tA=";
           in
           rec {
             fmo_frontend_react = api: pkgs.buildNpmPackage {
