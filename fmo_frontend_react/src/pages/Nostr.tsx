@@ -1,43 +1,80 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '../services/api';
+import { publishNostrEvent } from '../services/nostr';
 import { Copyable } from '../components/Copyable';
+import type { FederationHealth } from '../types/api';
+import { parseConfig, type FederationConfig } from '../utils/config';
 
 interface NostrFederation {
   id: string;
   name: string | null;
   invite: string;
-  health?: 'online' | 'degraded' | 'offline';
+  health?: FederationHealth;
 }
 
-interface FederationInfo {
-  name?: string;
-  guardians?: number;
-  modules?: string[];
-  network?: string;
-  config?: Record<string, unknown>; // Store the full config for announce
+interface FederationInfo extends FederationConfig {
+  name: string;
 }
 
-interface NostrEvent {
-  kind: number;
-  created_at: number;
-  tags: string[][];
-  content: string;
-  pubkey: string;
+// Each name lookup makes the server fetch the federation's config, so only a few run at once
+const NAME_LOOKUP_CONCURRENCY = 4;
+const NAME_LOOKUP_TIMEOUT_MS = 5000;
+// Names that arrive this close together update the list once
+const NAME_BATCH_MS = 200;
+
+// Meta values are parsed as JSON where possible, so a name like "21" arrives as a number
+function federationName(meta: Record<string, unknown>): string | null {
+  const name = meta.federation_name;
+  return name ? String(name) : null;
 }
 
-interface SignedNostrEvent extends NostrEvent {
-  id: string;
-  sig: string;
-}
-
-// Extend window type for Nostr extension
-declare global {
-  interface Window {
-    nostr?: {
-      getPublicKey(): Promise<string>;
-      signEvent(event: NostrEvent): Promise<SignedNostrEvent>;
-    };
+// Gives up after the timeout, or as soon as `signal` aborts
+async function fetchFederationName(invite: string, signal: AbortSignal): Promise<string | null> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timeout = setTimeout(abort, NAME_LOOKUP_TIMEOUT_MS);
+  signal.addEventListener('abort', abort);
+  try {
+    return federationName(await api.getFederationMetaByInvite(invite, controller.signal));
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener('abort', abort);
   }
+}
+
+// Looks up the names a few at a time and hands them to `onNames` in batches
+async function lookUpNames(
+  federations: NostrFederation[],
+  signal: AbortSignal,
+  onNames: (names: Map<string, string>) => void,
+) {
+  const pending = new Map<string, string>();
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  const flush = () => {
+    flushTimer = undefined;
+    if (signal.aborted || pending.size === 0) return;
+    onNames(new Map(pending));
+    pending.clear();
+  };
+
+  let next = 0;
+  const worker = async () => {
+    while (next < federations.length && !signal.aborted) {
+      const fed = federations[next++];
+      try {
+        const name = await fetchFederationName(fed.invite, signal);
+        if (name) {
+          pending.set(fed.id, name);
+          flushTimer ??= setTimeout(flush, NAME_BATCH_MS);
+        }
+      } catch (err) {
+        if (!signal.aborted) console.error(`Failed to fetch name for ${fed.id}:`, err);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: NAME_LOOKUP_CONCURRENCY }, worker));
+  clearTimeout(flushTimer);
+  flush();
 }
 
 export function Nostr() {
@@ -53,7 +90,7 @@ export function Nostr() {
   const [observedFederationIds, setObservedFederationIds] = useState<Set<string>>(new Set());
 
   // Federation checking logic (extracted for reuse)
-  const checkFederation = async (inviteCodeToCheck: string) => {
+  const checkFederation = async (inviteCodeToCheck: string, signal?: AbortSignal) => {
     // Clear previous data and errors
     setFederationInfo(null);
     setError(null);
@@ -69,55 +106,22 @@ export function Nostr() {
 
     try {
       // Fetch federation config
-      const configResponse = await fetch(
-        `${import.meta.env.VITE_FMO_API_BASE_URL || 'https://observer.fedimint.org/api'}/config/${inviteCodeToCheck}`
-      );
+      const config = await api.getFederationConfigByInvite(inviteCodeToCheck, signal);
 
-      if (!configResponse.ok) {
-        throw new Error('Failed to fetch federation config');
-      }
+      // Fetch federation metadata; it runs after the config request so the server answers it
+      // from the config it just cached. Without it the name is unknown.
+      const meta = await api.getFederationMetaByInvite(inviteCodeToCheck, signal).catch(() => null);
+      if (signal?.aborted) return;
 
-      const config = await configResponse.json();
-
-      // Fetch federation metadata
-      const metaResponse = await fetch(
-        `${import.meta.env.VITE_FMO_API_BASE_URL || 'https://observer.fedimint.org/api'}/config/${inviteCodeToCheck}/meta`
-      );
-
-      let name = 'Unknown';
-      if (metaResponse.ok) {
-        const meta = await metaResponse.json();
-        name = meta.federation_name || 'Unknown';
-      }
-
-      // Extract info from config
-      const guardians = config.global?.api_endpoints
-        ? Object.keys(config.global.api_endpoints).length
-        : 0;
-
-      const modules = config.modules
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ? Object.values(config.modules).map((mod: any) => mod.kind || 'unknown')
-        : [];
-
-      const walletModule = config.modules
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ? Object.values(config.modules).find((mod: any) => mod.kind === 'wallet')
-        : null;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const network = walletModule ? ((walletModule as any).network || 'unknown') : 'unknown';
-      
       setFederationInfo({
-        name,
-        guardians,
-        modules,
-        network,
-        config, // Store config for announce
+        name: (meta && federationName(meta)) || 'Unknown',
+        ...parseConfig(config),
       });
     } catch (err) {
+      if (signal?.aborted) return;
       setError(err instanceof Error ? err.message : 'Failed to fetch federation info');
     } finally {
-      setChecking(false);
+      if (!signal?.aborted) setChecking(false);
     }
   };
 
@@ -125,20 +129,25 @@ export function Nostr() {
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const checkParam = urlParams.get('check');
-    
-    if (checkParam) {
-      setInviteCode(checkParam);
-      checkFederation(checkParam);
-    }
+    if (!checkParam) return;
+
+    const controller = new AbortController();
+    setInviteCode(checkParam);
+    checkFederation(checkParam, controller.signal);
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+
     const fetchFederationsWithNames = async () => {
       try {
         const [nostrData, mainFederations] = await Promise.all([
-          api.getNostrFederations(),
-          api.getFederations()
+          api.getNostrFederations(signal),
+          api.getFederations(signal)
         ]);
+        if (signal.aborted) return;
 
         // Create a map of federation IDs to names from the main list
         const nameMap = new Map(
@@ -166,43 +175,33 @@ export function Nostr() {
         setLoading(false); // Stop loading immediately - show table with IDs
 
         // For federations without names, fetch from /config/{invite}/meta in background
-        const federationsWithoutNames = nostrFeds.filter(fed => !fed.name);
-
-        if (federationsWithoutNames.length > 0) {
-          const BASE_URL = import.meta.env.VITE_FMO_API_BASE_URL || 'https://observer.fedimint.org/api';
-
-          // Fetch names for federations without them (in background, non-blocking)
-          federationsWithoutNames.forEach(async (fed) => {
-            try {
-              const metaResponse = await fetch(`${BASE_URL}/config/${fed.invite}/meta`, {
-                signal: AbortSignal.timeout(5000), // 5 second timeout
-              });
-              if (metaResponse.ok) {
-                const meta = await metaResponse.json();
-                const fetchedName = meta.federation_name || null;
-
-                // Update this specific federation's name
-                if (fetchedName) {
-                  setFederations(prevFeds =>
-                    prevFeds.map(f =>
-                      f.id === fed.id ? { ...f, name: fetchedName } : f
-                    )
-                  );
-                }
-              }
-            } catch (err) {
-              console.error(`Failed to fetch name for ${fed.id}:`, err);
-            }
-          });
-        }
+        await lookUpNames(nostrFeds.filter(fed => !fed.name), signal, (names) => {
+          setFederations(prevFeds =>
+            prevFeds.map(f => {
+              const name = names.get(f.id);
+              return name ? { ...f, name } : f;
+            })
+          );
+        });
       } catch (err) {
+        if (signal.aborted) return;
         console.error('Failed to fetch nostr federations:', err);
         setLoading(false);
       }
     };
 
     fetchFederationsWithNames();
+    return () => controller.abort();
   }, []);
+
+  const onlineFederations = useMemo(
+    () => federations.filter(fed => fed.name && fed.health !== 'offline'),
+    [federations]
+  );
+  const offlineFederations = useMemo(
+    () => federations.filter(fed => !fed.name || fed.health === 'offline'),
+    [federations]
+  );
 
   const handleCheckFederation = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -210,68 +209,39 @@ export function Nostr() {
   };
 
   const handleAnnounceFederation = async () => {
-    if (!federationInfo?.config) return;
+    if (!federationInfo) return;
 
     setAnnouncing(true);
     setError(null);
     setAnnounceSuccess(false);
 
     try {
-      // Check if Nostr extension is available
-      if (!window.nostr) {
-        throw new Error('Nostr extension not found. Please install a Nostr browser extension like nos2x or Alby.');
-      }
-
-      const config = federationInfo.config;
-
-      // Calculate federation ID from config
-      const federationId = await calculateFederationId();
-
-      // Use the stored invite code (the one user entered)
-      if (!inviteCode.trim()) {
-        throw new Error('Invite code is required');
-      }
-
-      // Get network and modules
-      const network = federationInfo.network || 'unknown';
-      const modules = federationInfo.modules?.join(',') || '';
-
-      // Get public key from Nostr extension
-      const pubkey = await window.nostr.getPublicKey();
-
-      // Create unsigned event
-      const unsignedEvent: NostrEvent = {
-        kind: 38173,
-        created_at: Math.floor(Date.now() / 1000),
-        tags: [
-          ['d', federationId],
-          ['u', inviteCode],
-          ['n', network],
-          ['modules', modules],
-        ],
-        content: JSON.stringify((config as { global?: { meta?: Record<string, unknown> } }).global?.meta || {}),
-        pubkey,
-      };
-
-      // Sign event with Nostr extension
-      const signedEvent = await window.nostr.signEvent(unsignedEvent);
-
-      // Publish to backend
-      const response = await fetch(
-        `${import.meta.env.VITE_FMO_API_BASE_URL || 'https://observer.fedimint.org/api'}/nostr/federations`,
-        {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(signedEvent),
+      await publishNostrEvent(async () => {
+        // The server derives the federation ID from the invite code, since calculating
+        // it client-side would require crypto libraries
+        let federationId: string;
+        try {
+          federationId = await api.getFederationIdByInvite(inviteCode);
+        } catch (err) {
+          throw new Error(`Failed to calculate federation ID: ${err instanceof Error ? err.message : 'Unknown error'}`);
         }
-      );
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to announce federation (${response.status}): ${errorText}`);
-      }
+        // Use the stored invite code (the one user entered)
+        if (!inviteCode.trim()) {
+          throw new Error('Invite code is required');
+        }
+
+        return {
+          kind: 38173,
+          tags: [
+            ['d', federationId],
+            ['u', inviteCode],
+            ['n', federationInfo.network],
+            ['modules', federationInfo.modules.join(',')],
+          ],
+          content: JSON.stringify(federationInfo.raw.global?.meta || {}),
+        };
+      }, (event) => api.publishNostrFederation(event));
 
       setAnnounceSuccess(true);
       setError(null);
@@ -280,28 +250,6 @@ export function Nostr() {
       setAnnounceSuccess(false);
     } finally {
       setAnnouncing(false);
-    }
-  };
-
-  // Helper function to calculate federation ID from config
-  // This matches the Rust implementation's calculate_federation_id() function
-  const calculateFederationId = async (): Promise<string> => {
-    try {
-      // Use the API endpoint to calculate the federation ID from the invite code
-      // since calculating it client-side would require crypto libraries
-      const response = await fetch(
-        `${import.meta.env.VITE_FMO_API_BASE_URL || 'https://observer.fedimint.org/api'}/config/${inviteCode}/id`
-      );
-
-      if (!response.ok) {
-        throw new Error('Failed to fetch federation ID');
-      }
-
-      // The endpoint returns the FederationId directly as a JSON string
-      const federationId = await response.json();
-      return typeof federationId === 'string' ? federationId : String(federationId);
-    } catch (err) {
-      throw new Error(`Failed to calculate federation ID: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
   };
 
@@ -374,7 +322,7 @@ export function Nostr() {
                         {checking ? (
                           <div className="h-2.5 bg-gray-200 rounded-full dark:bg-gray-700 w-32 sm:w-48"></div>
                         ) : (
-                          federationInfo?.guardians || 0
+                          federationInfo?.guardians.length || 0
                         )}
                       </td>
                     </tr>
@@ -387,7 +335,7 @@ export function Nostr() {
                           <div className="h-2.5 bg-gray-200 rounded-full dark:bg-gray-700 w-32 sm:w-48"></div>
                         ) : (
                           <div className="flex flex-wrap gap-1">
-                            {federationInfo?.modules?.map((mod) => (
+                            {federationInfo?.modules.map((mod) => (
                               <span
                                 key={mod}
                                 className="bg-blue-600 text-white text-xs font-medium px-2.5 py-0.5 rounded-sm  dark:bg-indigo-500"
@@ -450,35 +398,33 @@ export function Nostr() {
             <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
               Loading...
             </div>
-          ) : federations.filter(fed => fed.name && fed.health !== 'offline').length === 0 ? (
+          ) : onlineFederations.length === 0 ? (
             <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
               No online Nostr federations found
             </div>
           ) : (
-            federations
-              .filter(fed => fed.name && fed.health !== 'offline')
-              .map((fed) => (
-                <div
-                  key={fed.id}
-                  className="bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 px-3 sm:px-6 py-3 sm:py-4 grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-2 text-xs sm:text-sm"
-                >
-                  <div className="font-medium text-gray-900 dark:text-white break-all">
-                    <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Name</span>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      {fed.name}
-                      {!observedFederationIds.has(fed.id) && (
-                        <span className="bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded-sm dark:bg-blue-900 dark:text-blue-300">
-                          Unobserved
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className='bg-transparent'>
-                    <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Invite Code</span>
-                    <Copyable text={fed.invite} />
+            onlineFederations.map((fed) => (
+              <div
+                key={fed.id}
+                className="bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 px-3 sm:px-6 py-3 sm:py-4 grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-2 text-xs sm:text-sm"
+              >
+                <div className="font-medium text-gray-900 dark:text-white break-all">
+                  <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Name</span>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {fed.name}
+                    {!observedFederationIds.has(fed.id) && (
+                      <span className="bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded-sm dark:bg-blue-900 dark:text-blue-300">
+                        Unobserved
+                      </span>
+                    )}
                   </div>
                 </div>
-              ))
+                <div className='bg-transparent'>
+                  <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Invite Code</span>
+                  <Copyable text={fed.invite} />
+                </div>
+              </div>
+            ))
           )}
         </div>
       </div>
@@ -511,7 +457,7 @@ export function Nostr() {
         {showOffline && (
           <>
             <div className="hidden sm:grid bg-gray-50 dark:bg-gray-700 px-3 sm:px-6 py-3 text-xs text-gray-700 dark:text-gray-400 uppercase font-semibold grid-cols-2 gap-2 border-y border-gray-200 dark:border-gray-600">
-              <div>Federation ID</div>
+              <div>Name / ID</div>
               <div>Invite Code</div>
             </div>
             <div className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -519,28 +465,26 @@ export function Nostr() {
                 <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
                   Loading...
                 </div>
-              ) : federations.filter(fed => !fed.name || fed.health === 'offline').length === 0 ? (
+              ) : offlineFederations.length === 0 ? (
                 <div className="px-3 sm:px-6 py-4 text-center text-xs sm:text-sm text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800">
                   No offline Nostr federations
                 </div>
               ) : (
-                federations
-                  .filter(fed => !fed.name || fed.health === 'offline')
-                  .map((fed) => (
-                    <div
-                      key={fed.id}
-                      className="bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 px-3 sm:px-6 py-3 sm:py-4 grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-2 text-xs sm:text-sm"
-                    >
-                      <div className="font-medium text-gray-900 dark:text-white break-all">
-                        <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Federation ID</span>
-                        {fed.name || fed.id}
-                      </div>
-                      <div className='bg-transparent'>
-                        <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Invite Code</span>
-                        <Copyable text={fed.invite} />
-                      </div>
+                offlineFederations.map((fed) => (
+                  <div
+                    key={fed.id}
+                    className="bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 px-3 sm:px-6 py-3 sm:py-4 grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-2 text-xs sm:text-sm"
+                  >
+                    <div className="font-medium text-gray-900 dark:text-white break-all">
+                      <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Name / ID</span>
+                      {fed.name || fed.id}
                     </div>
-                  ))
+                    <div className='bg-transparent'>
+                      <span className="text-[10px] sm:hidden uppercase text-gray-500 dark:text-gray-400 block mb-1">Invite Code</span>
+                      <Copyable text={fed.invite} />
+                    </div>
+                  </div>
+                ))
               )}
             </div>
           </>

@@ -2,23 +2,36 @@ import { useEffect, useState } from 'react';
 import { api } from '../services/api';
 import type { FedimintTotals } from '../types/api';
 import { toBitcoin, formatNumber } from '../utils/format';
+import { Alert } from './Alert';
 
 export function Totals() {
   const [totals, setTotals] = useState<FedimintTotals | null>(null);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
     api
-      .getTotals()
+      .getTotals(signal)
       .then((data) => {
+        if (signal.aborted) return;
         setTotals(data);
         setLoading(false);
       })
       .catch((err) => {
+        if (signal.aborted) return;
         console.error('Failed to fetch totals:', err);
+        setFailed(true);
         setLoading(false);
       });
+    return () => controller.abort();
   }, []);
+
+  // Zeros would read as real figures
+  if (failed) {
+    return <Alert level="error" message="Could not load the totals. Please try again later." />;
+  }
 
   return (
     <div className="grid grid-cols-3 gap-2 sm:gap-8 text-gray-900 dark:text-white px-4 sm:px-0">

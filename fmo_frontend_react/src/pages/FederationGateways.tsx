@@ -1,22 +1,23 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../services/api';
 import type {
   FederationSummary,
   GatewayInfo,
   GatewayUptimeTrendPoint,
+  GatewayWindow,
 } from '../types/api';
 import { GatewayWarningPage, type GatewayWarningState } from '../components/GatewayWarningPage';
 import { ErrorBoundary, ReloadMessage } from '../components/ErrorBoundary';
 import { readStorage, writeStorage } from '../utils/storage';
 import { useTheme } from '../hooks/useTheme';
+import { shortMiddle } from '../utils/format';
 import type { EChartsOption } from 'echarts';
 
 type GatewayStatus = 'online' | 'degraded' | 'offline' | 'unknown' | 'retired';
 type UptimeStripStatus = 'online' | 'degraded' | 'offline' | 'unknown';
 
-const GATEWAY_WINDOWS = ['24h', '7d', '30d', '90d'] as const;
-type SelectableWindow = (typeof GATEWAY_WINDOWS)[number];
+const GATEWAY_WINDOWS: readonly GatewayWindow[] = ['24h', '7d', '30d', '90d'];
 // 'all' means every active gateway; retired ones have their own filter
 const GATEWAY_FILTERS = ['all', 'online', 'degraded', 'offline', 'unknown', 'retired'] as const;
 const GATEWAY_SORTS = ['freshness', 'status', 'uptime', 'activity'] as const;
@@ -26,9 +27,9 @@ type SortDirection = (typeof SORT_DIRECTIONS)[number];
 
 const UptimeTrendChart = lazy(() => import('../components/UptimeTrendChart').then((module) => ({ default: module.UptimeTrendChart })));
 const INITIAL_RENDER_COUNT = 50;
-const DEFAULT_WINDOW: SelectableWindow = '7d';
+const DEFAULT_WINDOW: GatewayWindow = '7d';
 const WINDOW_STORAGE_KEY = 'gatewayWindow';
-const WINDOW_MINUTES: Record<SelectableWindow, number> = {
+const WINDOW_MINUTES: Record<GatewayWindow, number> = {
   '24h': 24 * 60,
   '7d': 7 * 24 * 60,
   '30d': 30 * 24 * 60,
@@ -106,11 +107,6 @@ function formatRelative(date: Date | null, now: number): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
-}
-
-function shortId(value: string): string {
-  if (value.length <= 16) return value;
-  return `${value.slice(0, 8)}...${value.slice(-8)}`;
 }
 
 function formatCompactDuration(minutes: number): string {
@@ -285,7 +281,7 @@ type LiveLookup =
   | { status: 'done'; gateways: GatewayInfo[]; error: string | null };
 
 interface LoadError {
-  window: SelectableWindow;
+  window: GatewayWindow;
   message: string;
   network: boolean; // fetch itself failed, as opposed to an error answer from the API
 }
@@ -296,7 +292,7 @@ interface GatewaySources {
   live: LiveLookup; // the federation's own registry, which only adds details
   federationFailed: boolean;
   federationOffline: boolean;
-  dataWindow: SelectableWindow;
+  dataWindow: GatewayWindow;
 }
 
 // Banners are only for problems or empty states; normal pages show none
@@ -419,18 +415,6 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
 }
 
-const DARK_QUERY = '(prefers-color-scheme: dark)';
-function subscribeToColorScheme(onChange: () => void) {
-  const media = window.matchMedia(DARK_QUERY);
-  media.addEventListener('change', onChange);
-  return () => media.removeEventListener('change', onChange);
-}
-
-// Re-renders when the system switches between light and dark, for the 'auto' theme
-function usePrefersDark(): boolean {
-  return useSyncExternalStore(subscribeToColorScheme, () => window.matchMedia(DARK_QUERY).matches);
-}
-
 export function FederationGateways() {
   // The router remounts this page per federation (App.tsx), so id never changes here
   const { id = '' } = useParams<{ id: string }>();
@@ -449,12 +433,12 @@ export function FederationGateways() {
   const [federationKey, setFederationKey] = useState(0);
   // Each response is stored with the window it belongs to, so a window switch never
   // recomputes the previous window's numbers against the new window's length
-  const [observed, setObserved] = useState<{ window: SelectableWindow; gateways: GatewayInfo[] } | null>(null);
+  const [observed, setObserved] = useState<{ window: GatewayWindow; gateways: GatewayInfo[] } | null>(null);
   const [observedError, setObservedError] = useState<LoadError | null>(null);
   const [observedLoading, setObservedLoading] = useState(true);
   const [live, setLive] = useState<LiveLookup>({ status: 'pending' });
   const [liveKey, setLiveKey] = useState(0);
-  const [trend, setTrend] = useState<{ window: SelectableWindow; points: GatewayUptimeTrendPoint[] } | null>(null);
+  const [trend, setTrend] = useState<{ window: GatewayWindow; points: GatewayUptimeTrendPoint[] } | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [reloadKey, setReloadKey] = useState(0); // Try again
@@ -479,7 +463,7 @@ export function FederationGateways() {
     setSearchParams(next, { replace: true });
   }, [setSearchParams]);
 
-  const selectWindow = (nextWindow: SelectableWindow) => {
+  const selectWindow = (nextWindow: GatewayWindow) => {
     writeStorage(WINDOW_STORAGE_KEY, nextWindow);
     updateView({ window: nextWindow });
   };
@@ -796,12 +780,10 @@ export function FederationGateways() {
     [filteredRows, visibleGatewayCount],
   );
 
-  const { theme } = useTheme();
-  const prefersDark = usePrefersDark();
-  const darkMode = theme === 'dark' || (theme === 'auto' && prefersDark);
-  const chartColors = useMemo(() => (darkMode
+  const { isDark } = useTheme();
+  const chartColors = useMemo(() => (isDark
     ? { label: '#9ca3af', axis: '#4b5563', grid: '#374151', line: '#60a5fa', area: 'rgba(96, 165, 250, 0.15)' }
-    : { label: '#6b7280', axis: '#d1d5db', grid: '#e5e7eb', line: '#2563eb', area: 'rgba(37, 99, 235, 0.12)' }), [darkMode]);
+    : { label: '#6b7280', axis: '#d1d5db', grid: '#e5e7eb', line: '#2563eb', area: 'rgba(37, 99, 235, 0.12)' }), [isDark]);
 
   // A window switch shows the loading state rather than the previous window's trend
   const uptimeTrend = trend?.window === timeWindow ? trend.points : EMPTY_TREND;
@@ -959,13 +941,13 @@ export function FederationGateways() {
                     className="text-xs font-mono text-gray-600 dark:text-gray-400 mt-1"
                     title={gateway.gateway_id}
                   >
-                    {shortId(gateway.gateway_id)}
+                    {shortMiddle(gateway.gateway_id, 8, 8, '...')}
                   </div>
                   <div
                     className="text-xs font-mono text-gray-500 dark:text-gray-500 mt-1"
                     title={gateway.node_pub_key}
                   >
-                    Node: {shortId(gateway.node_pub_key)}
+                    Node: {shortMiddle(gateway.node_pub_key, 8, 8, '...')}
                   </div>
                 </td>
                 <td className="block px-4 py-2 sm:table-cell sm:px-5 sm:py-4">
@@ -1053,7 +1035,7 @@ export function FederationGateways() {
                     <button
                       type="button"
                       onClick={() => setRawAnnouncement({
-                        gatewayName: gateway.lightning_alias || shortId(gateway.gateway_id),
+                        gatewayName: gateway.lightning_alias || shortMiddle(gateway.gateway_id, 8, 8, '...'),
                         raw: gateway.raw!,
                       })}
                       className="mt-2 text-xs text-gray-600 hover:text-blue-700 hover:underline dark:text-gray-400 dark:hover:text-blue-300"

@@ -6,7 +6,7 @@ export type BadgeLevel = 'info' | 'warning' | 'error' | 'success';
 interface BadgeProps {
   level: BadgeLevel;
   tooltip?: string;
-  children: ReactNode;
+  children?: ReactNode; // not needed for the icon-only badge (showIcon with a tooltip)
   showIcon?: boolean;
 }
 
