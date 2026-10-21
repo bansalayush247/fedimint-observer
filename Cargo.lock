@@ -2645,7 +2645,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitcoin 0.32.102",
- "esplora-client 0.10.0",
  "fedimint-core 0.12.0",
  "fedimint-wallet-common",
  "fmo_core",

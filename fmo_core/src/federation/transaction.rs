@@ -174,25 +174,14 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<HistogramEntry>> {
+        // Days with only output-only transactions (Lightning offers and
+        // such) are not shown, as before the daily activity table existed
         // language=postgresql
         const QUERY: &str = "
-            SELECT DATE(st.estimated_session_timestamp)            AS date,
-                   COUNT(DISTINCT t.txid)::bigint                  AS count,
-                   COALESCE(SUM(ti.total_input_amount), 0)::bigint AS amount
-            FROM transactions t
-                     JOIN
-                 session_times st ON t.session_index = st.session_index AND t.federation_id = st.federation_id
-                     JOIN
-                 (SELECT federation_id,
-                         txid,
-                         SUM(amount_msat) AS total_input_amount
-                  FROM transaction_inputs
-                  GROUP BY txid, federation_id) ti ON t.txid = ti.txid AND t.federation_id = ti.federation_id
-            WHERE t.federation_id = $1
-              -- Sessions before the first block height vote have no time yet
-              AND st.estimated_session_timestamp IS NOT NULL
-            GROUP BY date
-            ORDER BY date;
+            SELECT day AS date, funded_tx_count AS count, volume_msat AS amount
+            FROM federation_daily_activity
+            WHERE federation_id = $1 AND funded_tx_count > 0
+            ORDER BY day
         ";
 
         self.ensure_observed(federation_id).await?;

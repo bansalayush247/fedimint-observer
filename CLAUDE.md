@@ -77,7 +77,7 @@ just test_package fmo_core
 
 ### Key Patterns
 1. **Shared Types**: API types are defined in `fmo_api_types` for the backend; the React frontend mirrors them by hand in `fmo_frontend_react/src/types/api.ts`, so keep both in sync
-2. **Database Migrations**: Version-controlled SQL migrations in `fmo_core/schema/` (v0-v11)
+2. **Database Migrations**: Version-controlled SQL migrations in `fmo_core/schema/` (v0-v12)
 3. **Modules**: Core writes the module-agnostic rows of every session item from the summary the owning module returns, then lets the module write its own tables in the same transaction. Kinds without a module in the build are stored without amounts or details, and adding the module later does not fill them in yet (core rows are written once). The default build must keep mint, wallet and ln: the v8 and v11 backfills need them. Module-specific API endpoints and background tasks (UTXOs, nonces, gateways) still live in `fmo_core`.
 4. **Background Monitoring**: `FederationObserver` spawns tasks to monitor multiple federations concurrently
 5. **State Management**: Backend uses shared app state with Arc/RwLock for thread safety
@@ -96,9 +96,15 @@ Required environment variables (`sample.env` is a template; the server does not 
 - **Admin endpoints**: Require bearer token authentication via `FO_ADMIN_AUTH`
 
 ### Database Schema
-PostgreSQL with materialized views and complex indexes. Key tables:
+PostgreSQL. Key tables:
 - `federations` - Federation configurations
 - `sessions` - Consensus sessions
 - `transactions` - Transaction records
 - `guardian_health` - Guardian monitoring data
 - `nostr_*` - Nostr protocol integration
+
+Read models, kept current as data is written so requests never aggregate the full history (v9, v12):
+- `session_times`, `federation_daily_activity` - written per new session by `record_new_session()`, in the session's transaction; `rebuild_read_models()` after reprocessing stored sessions
+- `federation_totals` - transaction, volume and wallet counters, by triggers on inserts
+- `guardian_health_hourly` - by a trigger on `guardian_health`; readers add the partial first hour from raw rows
+- `utxos` - materialized view, refreshed every minute

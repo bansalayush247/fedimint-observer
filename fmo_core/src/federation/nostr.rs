@@ -21,8 +21,8 @@ use regex::Regex;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-use crate::federation::observer::FederationObserver;
-use crate::util::{query, query_one};
+use crate::federation::observer::{federation_id_from_db, FederationObserver};
+use crate::util::query;
 use crate::AppState;
 
 // TODO: move to common crate
@@ -199,28 +199,31 @@ impl FederationObserver {
         .collect()
     }
 
-    pub async fn federation_rating(
+    /// Number and average of star votes of every federation that has votes
+    pub async fn federation_ratings(
         &self,
-        federation_id: FederationId,
-    ) -> anyhow::Result<FederationRating> {
-        #[derive(Debug, Clone, FromRow)]
-        struct FederationRatingRow {
-            count: i64,
-            avg: Option<f64>,
-        }
-
-        let query_res = query_one::<FederationRatingRow>(
-            &self.connection().await?,
-            // language=postgresql
-            "SELECT COUNT(star_vote)::bigint as count, AVG(star_vote)::DOUBLE PRECISION as avg from nostr_votes WHERE federation_id = $1;",
-            &[&federation_id.consensus_encode_to_vec()],
-        )
-        .await?;
-
-        Ok(FederationRating {
-            count: query_res.count as u64,
-            avg: query_res.avg,
-        })
+    ) -> anyhow::Result<HashMap<FederationId, FederationRating>> {
+        self.connection()
+            .await?
+            .query(
+                // language=postgresql
+                "SELECT federation_id, COUNT(star_vote)::bigint, AVG(star_vote)::DOUBLE PRECISION
+                 FROM nostr_votes
+                 GROUP BY federation_id",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok((
+                    federation_id_from_db(&row.get::<_, Vec<u8>>(0))?,
+                    FederationRating {
+                        count: row.get::<_, i64>(1) as u64,
+                        avg: row.get(2),
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub async fn submit_rating(&self, nostr_event: Event) -> anyhow::Result<()> {

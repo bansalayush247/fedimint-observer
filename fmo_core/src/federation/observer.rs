@@ -25,9 +25,9 @@ use fedimint_core::{Amount, PeerId};
 use fedimint_wallet_common::endpoint_constants::WALLET_SUMMARY_ENDPOINT;
 use fedimint_wallet_common::{TxOutputSummary, WalletInput, WalletSummary};
 use fmo_api_types::{
-    FederationActivity, FederationHealth, FederationSummary, FederationUtxo, FedimintTotals,
-    GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus,
-    NonceSpendInfo,
+    FederationActivity, FederationHealth, FederationRating, FederationSummary, FederationUtxo,
+    FedimintTotals, GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim,
+    GuardianUtxoClaimStatus, NonceSpendInfo,
 };
 use futures::future::join_all;
 use futures::StreamExt;
@@ -60,6 +60,16 @@ const ONCHAIN_CHECK_DEADLINE: Duration = Duration::from_secs(8);
 const ONCHAIN_CHECK_CONCURRENCY: usize = 8;
 /// Each nonce is matched against the federation's mint inputs
 const MAX_NONCES_PER_REQUEST: usize = 1000;
+/// Per request to the mempool instance; callers bound their total time
+/// themselves
+const ESPLORA_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Federations whose consensus meta the list page fetches at once when it
+/// isn't cached yet
+const SUMMARY_META_CONCURRENCY: usize = 16;
+const NO_ACTIVITY: FederationActivity = FederationActivity {
+    num_transactions: 0,
+    amount_transferred: Amount::ZERO,
+};
 
 /// State of a transaction output according to the blockchain
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +89,8 @@ pub enum OnChainOutput {
 pub struct FederationObserver {
     connection_pool: deadpool_postgres::Pool,
     admin_auth: String,
-    mempool_url: String,
+    /// Shared so requests reuse its connections to the mempool instance
+    esplora: esplora_client::AsyncClient,
     task_group: TaskGroup,
     consensus_meta_cache: ConsensusMetaCache,
     connectors: ConnectorRegistry,
@@ -116,11 +127,14 @@ impl FederationObserver {
         }?;
 
         let connectors = ConnectorRegistry::build_from_client_env()?.bind().await?;
+        let esplora = esplora_client::Builder::new(mempool_url)
+            .timeout(ESPLORA_REQUEST_TIMEOUT.as_secs())
+            .build_async()?;
 
         let slf = FederationObserver {
             connection_pool,
             admin_auth: admin_auth.to_owned(),
-            mempool_url: mempool_url.to_owned(),
+            esplora,
             task_group: Default::default(),
             consensus_meta_cache: Default::default(),
             connectors,
@@ -315,6 +329,7 @@ impl FederationObserver {
                 "/schema/v11.sql",
                 FederationObserver::backfill_peg_in_outpoints
             ),
+            migration!("/schema/v12.sql"),
         ];
 
         ensure!(
@@ -425,7 +440,7 @@ impl FederationObserver {
                 let outcome = outcome??;
                 self.process_session(
                     fed.federation_id,
-                    fed.config.clone(),
+                    &fed.config,
                     outcome.session_index as u64,
                     outcome.data,
                     dbtx,
@@ -531,16 +546,18 @@ impl FederationObserver {
         query(&self.connection().await?, "SELECT * FROM federations", &[]).await
     }
 
+    /// The federation list. Runs the same few queries however many
+    /// federations are observed; only consensus meta not cached yet is fetched
+    /// per federation.
     pub async fn list_federation_summaries(&self) -> anyhow::Result<Vec<FederationSummary>> {
         let federations = self.list_federations().await?;
-
         let federation_health = self.get_guardian_health_summary().await?;
+        let assets = self.federation_assets().await?;
+        let mut activity = self.federations_activity(7).await?;
+        let mut ratings = self.federation_ratings().await?;
 
-        join_all(federations.into_iter().map(|federation| {
-            let federation_health_ref = &federation_health;
-            async move {
-                let deposits = self.get_federation_assets(federation.federation_id).await?;
-
+        futures::stream::iter(federations)
+            .map(|federation| async {
                 let name = self
                     .consensus_meta_cache
                     .fetch_meta_cached(&federation.config.to_json(), &self.connectors)
@@ -554,88 +571,115 @@ impl FederationObserver {
                             .get("federation_name")
                             .cloned()
                     });
-
-                let health = federation_health_ref
-                    .get(&federation.federation_id)
-                    .copied()
-                    .unwrap_or(FederationHealth::Offline);
-
-                let last_7d_activity = self
-                    .federation_activity(federation.federation_id, 7)
-                    .await?;
-
+                (federation, name)
+            })
+            .buffered(SUMMARY_META_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|(federation, name)| {
+                let federation_id = federation.federation_id;
                 let (first_peer_id, first_peer_url) = federation
                     .config
                     .global
                     .api_endpoints
                     .first_key_value()
-                    .expect("At least one peer");
+                    .context("Federation config has no guardians")?;
                 let invite = InviteCode::new(
                     first_peer_url.url.clone(),
                     *first_peer_id,
-                    federation.federation_id,
+                    federation_id,
                     None,
                 )
                 .to_string();
 
                 Ok(FederationSummary {
-                    id: federation.federation_id,
+                    id: federation_id,
                     name,
-                    last_7d_activity,
-                    deposits,
+                    last_7d_activity: activity
+                        .remove(&federation_id)
+                        .unwrap_or_else(|| vec![NO_ACTIVITY; 7]),
+                    deposits: assets.get(&federation_id).copied().unwrap_or(Amount::ZERO),
                     invite,
-                    nostr_votes: self.federation_rating(federation.federation_id).await?,
-                    health,
+                    nostr_votes: ratings.remove(&federation_id).unwrap_or(FederationRating {
+                        count: 0,
+                        avg: None,
+                    }),
+                    health: federation_health
+                        .get(&federation_id)
+                        .copied()
+                        .unwrap_or(FederationHealth::Offline),
                 })
-            }
-        }))
-        .await
-        .into_iter()
-        .collect()
+            })
+            .collect()
     }
 
-    async fn federation_activity(
+    /// Each federation's transactions and volume on each of the last `days`
+    /// days, oldest first
+    async fn federations_activity(
         &self,
-        federation_id: FederationId,
         days: u32,
-    ) -> anyhow::Result<Vec<FederationActivity>> {
+    ) -> anyhow::Result<HashMap<FederationId, Vec<FederationActivity>>> {
         #[derive(Debug, FromRow)]
-        struct FederationActivityRow {
-            date: NaiveDate,
+        struct ActivityRow {
+            federation_id: Vec<u8>,
+            day: NaiveDate,
             tx_count: i64,
-            total_amount: i64,
+            volume_msat: i64,
         }
 
-        let now = chrono::offset::Utc::now();
+        let today = chrono::Utc::now().date_naive();
+        let rows = query::<ActivityRow>(
+            &self.connection().await?,
+            "SELECT federation_id, day, tx_count, volume_msat
+             FROM federation_daily_activity
+             WHERE day > $1",
+            &[&(today - chrono::Duration::days(days.into()))],
+        )
+        .await?;
 
-        // language=postgresql
-        let activity = query::<FederationActivityRow>(&self.connection().await?, "
-            SELECT DATE(st.estimated_session_timestamp) AS date,
-                   COUNT(DISTINCT t.txid)::bigint       AS tx_count,
-                   COALESCE(SUM((SELECT SUM(amount_msat)
-                        FROM transaction_inputs
-                        WHERE transaction_inputs.txid = t.txid AND transaction_inputs.federation_id = t.federation_id))::bigint, 0)   AS total_amount
-            FROM transactions t
-                     JOIN
-                 session_times st ON t.session_index = st.session_index AND t.federation_id = st.federation_id
-            WHERE t.federation_id = $1  AND st.estimated_session_timestamp >= $2
-            GROUP BY date
-            ORDER BY date;
-        ", &[&federation_id.consensus_encode_to_vec(), &(now - chrono::Duration::days(8)).naive_utc()]).await?;
-
-        Ok(last_n_day_iter(now.date_naive(), days)
-            .map(|date| {
-                let (tx_count, total_amt) = activity
-                    .iter()
-                    .find(|row| row.date == date)
-                    .map(|row| (row.tx_count, row.total_amount))
-                    .unwrap_or((0, 0));
-                FederationActivity {
-                    num_transactions: tx_count as u64,
-                    amount_transferred: Amount::from_msats(total_amt as u64),
-                }
+        let mut by_federation = HashMap::<FederationId, HashMap<NaiveDate, ActivityRow>>::new();
+        for row in rows {
+            by_federation
+                .entry(federation_id_from_db(&row.federation_id)?)
+                .or_default()
+                .insert(row.day, row);
+        }
+        Ok(by_federation
+            .into_iter()
+            .map(|(federation_id, days_activity)| {
+                let activity = last_n_day_iter(today, days)
+                    .map(|day| {
+                        days_activity
+                            .get(&day)
+                            .map_or(NO_ACTIVITY, |row| FederationActivity {
+                                num_transactions: row.tx_count as u64,
+                                amount_transferred: Amount::from_msats(row.volume_msat as u64),
+                            })
+                    })
+                    .collect();
+                (federation_id, activity)
             })
             .collect())
+    }
+
+    /// What each federation's wallet holds: all peg-ins minus all peg-outs
+    async fn federation_assets(&self) -> anyhow::Result<HashMap<FederationId, Amount>> {
+        self.connection()
+            .await?
+            .query(
+                "SELECT federation_id, wallet_in_msat - wallet_out_msat FROM federation_totals",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok((
+                    federation_id_from_db(&row.get::<_, Vec<u8>>(0))?,
+                    Amount::from_msats(row.get::<_, i64>(1) as u64),
+                ))
+            })
+            .collect()
     }
 
     pub async fn get_federation(
@@ -715,8 +759,7 @@ impl FederationObserver {
     }
 
     async fn fetch_block_times_inner(&self) -> anyhow::Result<()> {
-        let builder = esplora_client::Builder::new(&self.mempool_url);
-        let esplora_client = builder.build_async()?;
+        let esplora_client = &self.esplora;
 
         // block_times.sql seeds the table on first start, so the fallback only
         // matters if that seed is ever dropped. Block 820k was mined Dec 2023,
@@ -809,14 +852,27 @@ impl FederationObserver {
         while let Some((session_index, signed_session_outcome)) = session_stream.next().await {
             let mut connection = self.connection().await?;
             let dbtx = connection.transaction().await?;
-            self.process_session(
-                federation_id,
-                config.clone(),
-                session_index,
-                signed_session_outcome,
-                &dbtx,
-            )
-            .await?;
+            let new = self
+                .process_session(
+                    federation_id,
+                    &config,
+                    session_index,
+                    signed_session_outcome,
+                    &dbtx,
+                )
+                .await?;
+            // Read models count each session once, in the transaction that
+            // stores it. A session that was already stored has been counted.
+            if new {
+                dbtx.execute(
+                    "SELECT record_new_session($1, $2)",
+                    &[
+                        &federation_id.consensus_encode_to_vec(),
+                        &(session_index as i32),
+                    ],
+                )
+                .await?;
+            }
             dbtx.commit().await?;
             progress.record(session_index);
         }
@@ -824,23 +880,26 @@ impl FederationObserver {
         unreachable!("Session stream should never end")
     }
 
+    /// Stores a session and its items. Returns whether the session was new;
+    /// items of a stored session are filled in where missing.
     async fn process_session(
         &self,
         federation_id: FederationId,
-        config: ClientConfig,
+        config: &ClientConfig,
         session_index: u64,
         signed_session_outcome: SessionOutcome,
         dbtx: &Transaction<'_>,
-    ) -> anyhow::Result<()> {
-        dbtx.execute(
-            "INSERT INTO sessions VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            &[
-                &federation_id.consensus_encode_to_vec(),
-                &(session_index as i32),
-                &signed_session_outcome.consensus_encode_to_vec(),
-            ],
-        )
-        .await?;
+    ) -> anyhow::Result<bool> {
+        let inserted = dbtx
+            .execute(
+                "INSERT INTO sessions VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &[
+                    &federation_id.consensus_encode_to_vec(),
+                    &(session_index as i32),
+                    &signed_session_outcome.consensus_encode_to_vec(),
+                ],
+            )
+            .await?;
 
         for (item_idx, item) in signed_session_outcome.items.into_iter().enumerate() {
             match item.item {
@@ -848,7 +907,7 @@ impl FederationObserver {
                     self.process_transaction(
                         dbtx,
                         federation_id,
-                        &config,
+                        config,
                         session_index,
                         item_idx as u64,
                         transaction,
@@ -859,7 +918,7 @@ impl FederationObserver {
                     self.process_ci(
                         dbtx,
                         federation_id,
-                        &config,
+                        config,
                         session_index,
                         item_idx as u64,
                         item.peer,
@@ -874,7 +933,7 @@ impl FederationObserver {
         }
 
         debug!("Processed session {session_index} of federation {federation_id}");
-        Ok(())
+        Ok(inserted == 1)
     }
 
     async fn process_transaction(
@@ -890,7 +949,7 @@ impl FederationObserver {
         let ctx = ProcessCtx {
             dbtx,
             config,
-            mempool_url: &self.mempool_url,
+            esplora: &self.esplora,
         };
 
         dbtx.execute(
@@ -1046,7 +1105,7 @@ impl FederationObserver {
         let ctx = ProcessCtx {
             dbtx,
             config,
-            mempool_url: &self.mempool_url,
+            esplora: &self.esplora,
         };
         let meta = CiMeta {
             federation_id,
@@ -1076,7 +1135,6 @@ impl FederationObserver {
             .await?
             .batch_execute(
                 "
-                REFRESH MATERIALIZED VIEW CONCURRENTLY session_times;
                 REFRESH MATERIALIZED VIEW CONCURRENTLY utxos;
                 ",
             )
@@ -1091,15 +1149,10 @@ impl FederationObserver {
     ) -> anyhow::Result<Amount> {
         let total_assets_msat = query_value::<i64>(
             &self.connection().await?,
-            "
-        SELECT
-            CAST((SELECT COALESCE(SUM(amount_msat), 0)
-             FROM transaction_inputs
-             WHERE kind = 'wallet' AND federation_id = $1) -
-            (SELECT COALESCE(SUM(amount_msat), 0)
-             FROM transaction_outputs
-             WHERE kind = 'wallet' AND federation_id = $1) AS BIGINT) AS net_amount_msat
-        ",
+            "SELECT COALESCE(
+                 (SELECT wallet_in_msat - wallet_out_msat FROM federation_totals WHERE federation_id = $1),
+                 0
+             )",
             &[&federation_id.consensus_encode_to_vec()],
         )
         .await?;
@@ -1287,18 +1340,11 @@ impl FederationObserver {
             return results;
         }
 
-        let client = match esplora_client::Builder::new(&self.mempool_url).build_async() {
-            Ok(client) => client,
-            Err(error) => {
-                warn!("Failed to build esplora client: {error:?}");
-                return results;
-            }
-        };
         let mut lookups = futures::stream::iter(to_fetch)
             .map(|(out_point, with_amount)| {
-                let client = client.clone();
+                let client = &self.esplora;
                 async move {
-                    let output = fetch_onchain_output(&client, out_point, with_amount).await;
+                    let output = fetch_onchain_output(client, out_point, with_amount).await;
                     (out_point, output)
                 }
             })
@@ -1475,7 +1521,7 @@ impl FederationObserver {
                 let outcome = db::SessionOutcome::try_from_row_with_decoders(&row, &decoders)?;
                 self.process_session(
                     federation_id,
-                    federation.config.clone(),
+                    &federation.config,
                     outcome.session_index as u64,
                     outcome.data,
                     &dbtx,
@@ -1491,6 +1537,17 @@ impl FederationObserver {
             }
             batch_start = batch_end + 1;
         }
+
+        // Restored votes can move session times, and restored transactions
+        // change daily activity
+        info!("Rebuilding read models of federation {federation_id} from session {session_start}");
+        self.connection()
+            .await?
+            .execute(
+                "SELECT rebuild_read_models($1, $2)",
+                &[&federation_id.consensus_encode_to_vec(), &session_start],
+            )
+            .await?;
 
         info!("Backfill complete!");
         Ok(())
@@ -1525,6 +1582,13 @@ impl SyncProgress {
         self.logged_at = Instant::now();
         self.logged_position = position;
     }
+}
+
+pub(crate) fn federation_id_from_db(bytes: &[u8]) -> anyhow::Result<FederationId> {
+    Ok(FederationId::consensus_decode_whole(
+        bytes,
+        &Default::default(),
+    )?)
 }
 
 fn last_n_day_iter(now: NaiveDate, days: u32) -> impl Iterator<Item = NaiveDate> {

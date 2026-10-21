@@ -132,7 +132,11 @@ impl FederationObserver {
             // native skip-scan. With the guardian ids known we can fetch each
             // latest row with a single index descent.
             // language=postgresql
-            "WITH RECURSIVE guardians AS (
+            "WITH RECURSIVE window_bounds AS (
+                 SELECT NOW() - INTERVAL '30 days' AS since,
+                        date_trunc('hour', (NOW() - INTERVAL '30 days')::timestamp) + INTERVAL '1 hour' AS rollup_from
+             ),
+             guardians AS (
                  SELECT (SELECT h.guardian_id
                          FROM guardian_health h
                          WHERE h.federation_id = $1
@@ -164,14 +168,27 @@ impl FederationObserver {
                  ORDER BY h.time DESC
                  LIMIT 1
              ) latest
+             -- Whole hours of the window come from the hourly rollup, the
+             -- partial first hour from the raw samples. Same result as
+             -- aggregating all raw samples of the last 30 days.
              INNER JOIN (
                  SELECT
                      guardian_id,
-                     (COUNT(status)::decimal / COUNT(*)::decimal * 100)::real as uptime,
-                     AVG(latency_ms)::real as latency_ms
-                 FROM guardian_health
-                 WHERE federation_id = $1
-                   AND time > NOW() - INTERVAL '30 days'
+                     (SUM(online_samples)::decimal / SUM(samples)::decimal * 100)::real AS uptime,
+                     (SUM(latency_sum_ms)::decimal / NULLIF(SUM(latency_samples), 0))::real AS latency_ms
+                 FROM (
+                     SELECT h.guardian_id, h.samples, h.online_samples, h.latency_samples, h.latency_sum_ms
+                     FROM guardian_health_hourly h, window_bounds b
+                     WHERE h.federation_id = $1 AND h.hour >= b.rollup_from
+                   UNION ALL
+                     SELECT raw.guardian_id,
+                            1,
+                            (raw.status IS NOT NULL)::int,
+                            (raw.latency_ms IS NOT NULL)::int,
+                            COALESCE(raw.latency_ms, 0)
+                     FROM guardian_health raw, window_bounds b
+                     WHERE raw.federation_id = $1 AND raw.time > b.since AND raw.time < b.rollup_from
+                 ) samples
                  GROUP BY guardian_id
              ) last30d ON g.guardian_id = last30d.guardian_id
              WHERE g.guardian_id IS NOT NULL",

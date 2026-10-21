@@ -74,8 +74,8 @@ pub struct OutputSummary {
 pub struct ProcessCtx<'a> {
     pub dbtx: &'a DbTransaction<'a>,
     pub config: &'a ClientConfig,
-    /// Esplora API of the configured mempool instance
-    pub mempool_url: &'a str,
+    /// Client of the configured mempool instance
+    pub esplora: &'a esplora_client::AsyncClient,
 }
 
 /// A Fedimint module the observer can decode and process.

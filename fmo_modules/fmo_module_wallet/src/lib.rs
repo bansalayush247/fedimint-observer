@@ -233,10 +233,7 @@ impl ObserverModule for WalletObserver {
                     return Ok(());
                 }
 
-                let builder = esplora_client::Builder::new(ctx.mempool_url);
-                let client = builder
-                    .build_async()
-                    .context("Failed to build esplora client")?;
+                let client = ctx.esplora;
 
                 // Bounded: this runs inside the session's database transaction.
                 // On failure the session is rolled back and retried 30 s later,
