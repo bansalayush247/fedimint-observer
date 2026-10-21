@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,7 @@ use futures::future::join_all;
 use futures::StreamExt;
 use postgres_from_row::FromRow;
 use subtle::ConstantTimeEq;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 use tracing::{debug, info, info_span, warn, Instrument};
@@ -819,19 +821,25 @@ impl FederationObserver {
         let next_session = self.next_session_index(federation_id).await?;
         debug!("Next session {next_session}");
         let api_fetch = api.clone();
+        let gate = SessionFetchGate::new(next_session);
+        let fetch_gate = gate.clone();
         let mut session_stream = futures::stream::iter(next_session..)
             .map(move |session_index| {
                 debug!("Starting fetch job for session {session_index}");
                 let api_fetch_single = api_fetch.clone();
                 let decoders_single = decoders.clone();
+                let gate = fetch_gate.clone();
                 async move {
                     let signed_session_outcome = retry(
                         format!("Waiting for session {session_index}"),
                         background_backoff(),
                         || async {
-                            api_fetch_single
+                            gate.wait_turn(session_index).await;
+                            let result = api_fetch_single
                                 .await_block(session_index, &decoders_single)
-                                .await
+                                .await;
+                            gate.record(result.is_ok());
+                            result
                         },
                     )
                     .await
@@ -868,6 +876,7 @@ impl FederationObserver {
                 .await?;
             }
             dbtx.commit().await?;
+            gate.stored(session_index);
             progress.record(session_index);
         }
 
@@ -1548,6 +1557,59 @@ impl FederationObserver {
     }
 }
 
+/// Up to 32 sessions are fetched at once, each retrying on its own. While the
+/// guardians don't answer, that is 32 failing requests a minute for a
+/// federation that may have been gone for months. Then only the fetch of the
+/// next session to store keeps trying; the first fetch that succeeds lets the
+/// others go on.
+#[derive(Clone)]
+struct SessionFetchGate(Arc<SessionFetchGateState>);
+
+struct SessionFetchGateState {
+    /// Whether the last fetch that finished failed
+    failing: AtomicBool,
+    next_to_store: AtomicU64,
+    changed: Notify,
+}
+
+impl SessionFetchGate {
+    fn new(next_to_store: u64) -> Self {
+        Self(Arc::new(SessionFetchGateState {
+            failing: AtomicBool::new(false),
+            next_to_store: AtomicU64::new(next_to_store),
+            changed: Notify::new(),
+        }))
+    }
+
+    /// Returns once the session's fetch may ask the guardians
+    async fn wait_turn(&self, session_index: u64) {
+        loop {
+            // Created before checking, so a change in between still wakes it
+            let changed = self.0.changed.notified();
+            if !self.0.failing.load(Ordering::SeqCst)
+                || self.0.next_to_store.load(Ordering::SeqCst) >= session_index
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn record(&self, succeeded: bool) {
+        let was_failing = self.0.failing.swap(!succeeded, Ordering::SeqCst);
+        if was_failing && succeeded {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    fn stored(&self, session_index: u64) {
+        self.0
+            .next_to_store
+            .store(session_index + 1, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+}
+
 /// Logs how far a sync got and how fast, at most every 5 s
 struct SyncProgress {
     unit: &'static str,
@@ -1691,7 +1753,29 @@ fn append_claimed_utxos(
 
 #[cfg(test)]
 mod tests {
-    use crate::federation::observer::last_n_day_iter;
+    use futures::FutureExt;
+
+    use crate::federation::observer::{last_n_day_iter, SessionFetchGate};
+
+    #[tokio::test]
+    async fn only_the_next_session_is_fetched_while_fetches_fail() {
+        let gate = SessionFetchGate::new(10);
+        assert!(gate.wait_turn(12).now_or_never().is_some());
+
+        gate.record(false);
+        assert!(gate.wait_turn(10).now_or_never().is_some());
+        let mut later = Box::pin(gate.wait_turn(12));
+        assert!((&mut later).now_or_never().is_none());
+
+        // Storing session 10 makes 11 the next, 12 still waits
+        gate.stored(10);
+        assert!(gate.wait_turn(11).now_or_never().is_some());
+        assert!((&mut later).now_or_never().is_none());
+
+        // A fetch that succeeds lets the waiting ones go on
+        gate.record(true);
+        assert!(later.now_or_never().is_some());
+    }
 
     #[test]
     fn test_day_iter() {
