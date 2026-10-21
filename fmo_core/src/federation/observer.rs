@@ -165,13 +165,7 @@ impl FederationObserver {
         let observer = slf.clone();
         slf.task_group.spawn_cancellable(
             "sync nostr events",
-            supervise("Nostr sync", move || {
-                let observer = observer.clone();
-                async move {
-                    observer.sync_nostr_events().await;
-                    Ok(())
-                }
-            }),
+            supervise("Nostr sync", move || observer.clone().sync_nostr_events()),
         );
         let observer = slf.clone();
         slf.task_group.spawn_cancellable(
