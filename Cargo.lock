@@ -2595,7 +2595,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fmo_server"
+name = "fmo_core"
 version = "0.2.0"
 dependencies = [
  "anyhow",
@@ -2631,6 +2631,15 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fmo_server"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "fmo_core",
+ "tokio",
 ]
 
 [[package]]

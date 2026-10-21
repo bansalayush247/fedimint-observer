@@ -58,14 +58,15 @@ just pg_restore BACKUP_FILE
 
 ### Testing Specific Components
 ```bash
-just test_package fmo_server
+just test_package fmo_core
 ```
 
 ## Architecture Overview
 
 ### Workspace Structure
 - `fmo_api_types/` - Shared API types between frontend and backend
-- `fmo_server/` - Backend server (Axum + PostgreSQL)
+- `fmo_core/` - Backend library (Axum + PostgreSQL): fetching, storage, API and shared services
+- `fmo_server/` - Thin binary that runs `fmo_core`
   - `/config/*` endpoints - Federation configuration API (stable)
   - `/federations/*` endpoints - Federation monitoring API (unstable)
   - Background tasks for monitoring federations and syncing data
@@ -73,7 +74,7 @@ just test_package fmo_server
 
 ### Key Patterns
 1. **Shared Types**: All API types are defined in `fmo_api_types` and used by both frontend and backend
-2. **Database Migrations**: Version-controlled SQL migrations in `fmo_server/schema/` (v0-v8)
+2. **Database Migrations**: Version-controlled SQL migrations in `fmo_core/schema/` (v0-v11)
 3. **Background Monitoring**: `FederationObserver` spawns tasks to monitor multiple federations concurrently
 4. **State Management**: Backend uses shared app state with Arc/RwLock for thread safety
 5. **Error Handling**: Custom `AppError` type wrapping `anyhow::Error` for consistent error propagation
