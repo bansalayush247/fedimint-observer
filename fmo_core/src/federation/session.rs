@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use anyhow::Context;
 use axum::extract::{Path, State};
 use axum::Json;
 use fedimint_core::config::FederationId;
@@ -53,9 +52,7 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<SessionData>> {
-        self.get_federation(federation_id)
-            .await?
-            .context("Federation doesn't exist")?;
+        self.ensure_observed(federation_id).await?;
 
         query::<SessionData>(&self.connection().await?, "
             SELECT s.session_index::bigint AS session_index, COUNT(t.txid) AS transaction_count
@@ -72,12 +69,12 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<u64> {
-        let session_count =
-            query_value::<i64>(
-                &self.connection().await?,
-                "SELECT COALESCE(COUNT(session_index), 0) as max_session_index FROM sessions WHERE federation_id = $1",
-                &[&federation_id.consensus_encode_to_vec()]
-            ).await?;
+        let session_count = query_value::<i64>(
+            &self.connection().await?,
+            "SELECT COUNT(*) FROM sessions WHERE federation_id = $1",
+            &[&federation_id.consensus_encode_to_vec()],
+        )
+        .await?;
         Ok(session_count as u64)
     }
 
@@ -98,8 +95,9 @@ impl FederationObserver {
             (row.get::<_, i64>(0), row.get::<_, i64>(1))
         };
         if next != count {
+            // Sync continues after the newest session, so these are not fetched again
             tracing::warn!(
-                "Federation {federation_id} is missing {} of its first {next} sessions; use the backfill endpoint after refetching them",
+                "Federation {federation_id} is missing {} of its first {next} sessions",
                 next - count
             );
         }

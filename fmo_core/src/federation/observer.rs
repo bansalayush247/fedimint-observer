@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context};
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, OutPoint, Txid};
 use chrono::{DateTime, NaiveDate};
 use deadpool_postgres::{GenericClient, Runtime, Transaction};
-use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
+use fedimint_api_client::api::FederationApiExt;
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::core::DynModuleConsensusItem;
@@ -35,8 +35,7 @@ use postgres_from_row::FromRow;
 use subtle::ConstantTimeEq;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
-use tracing::log::info;
-use tracing::{debug, info_span, warn, Instrument};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::config::meta::{ConsensusMetaCache, MetaFieldsExt};
 use crate::db::{migration, migration_backfill, schema_setup, DbMigration};
@@ -45,7 +44,7 @@ use crate::federation::gateways::GatewayOverviewCache;
 use crate::federation::{db, instance_to_kind};
 use crate::module::{CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx};
 use crate::task::supervise;
-use crate::util::{execute, query, query_one, query_opt, query_value};
+use crate::util::{federation_api, module_instance_id, query, query_one, query_opt, query_value};
 
 /// Guardian wallet summaries younger than this are reused, so page views don't
 /// each send a request to every guardian.
@@ -135,7 +134,7 @@ impl FederationObserver {
         slf.setup_schema().await?;
 
         for federation in slf.list_federations().await? {
-            slf.spawn_observer(federation).await;
+            slf.spawn_observer(federation);
         }
 
         let observer = slf.clone();
@@ -208,7 +207,7 @@ impl FederationObserver {
         &self.gateway_overviews
     }
 
-    async fn spawn_observer(&self, federation: Federation) {
+    fn spawn_observer(&self, federation: Federation) {
         let slf = self.clone();
 
         let federation_id = federation.federation_id;
@@ -251,9 +250,10 @@ impl FederationObserver {
     }
 
     async fn setup_schema(&self) -> anyhow::Result<()> {
-        execute(
-            &self.connection().await?,
-            "
+        self.connection()
+            .await?
+            .batch_execute(
+                "
             CREATE OR REPLACE FUNCTION get_max_version() RETURNS INTEGER AS $$
             DECLARE
                 max_version INTEGER;
@@ -281,9 +281,8 @@ impl FederationObserver {
             END;
             $$ LANGUAGE plpgsql;
             ",
-            &[],
-        )
-        .await?;
+            )
+            .await?;
 
         let maybe_schema_version =
             match query_value::<i32>(&self.connection().await?, "SELECT get_max_version();", &[])
@@ -416,16 +415,14 @@ impl FederationObserver {
                                     row_idx, rows_count, percentage_str
                                 );
                             }
-                            db::SessionOutcome::from_row_with_decoders(
-                                &row,
-                                &decoders_clone.clone(),
-                            )
+                            db::SessionOutcome::try_from_row_with_decoders(&row, &decoders_clone)
                         })
                     })
                     .buffered(num_cpus)
                     .boxed();
 
-            while let Some(outcome) = parsing_stream.next().await.transpose()? {
+            while let Some(outcome) = parsing_stream.next().await {
+                let outcome = outcome??;
                 self.process_session(
                     fed.federation_id,
                     fed.config.clone(),
@@ -535,10 +532,7 @@ impl FederationObserver {
     }
 
     pub async fn list_federation_summaries(&self) -> anyhow::Result<Vec<FederationSummary>> {
-        // TODO: possibly combine list and health query
-        let federations =
-            query::<Federation>(&self.connection().await?, "SELECT * FROM federations", &[])
-                .await?;
+        let federations = self.list_federations().await?;
 
         let federation_health = self.get_guardian_health_summary().await?;
 
@@ -656,6 +650,19 @@ impl FederationObserver {
         .await
     }
 
+    /// Fails unless the federation is observed. Unlike
+    /// [`Self::get_federation`], doesn't decode the federation's config.
+    pub async fn ensure_observed(&self, federation_id: FederationId) -> anyhow::Result<()> {
+        let observed = query_value::<bool>(
+            &self.connection().await?,
+            "SELECT EXISTS (SELECT 1 FROM federations WHERE federation_id = $1)",
+            &[&federation_id.consensus_encode_to_vec()],
+        )
+        .await?;
+        ensure!(observed, "Federation {federation_id} is not observed");
+        Ok(())
+    }
+
     pub async fn add_federation(&self, invite: &InviteCode) -> anyhow::Result<FederationId> {
         let federation_id = invite.federation_id();
 
@@ -680,8 +687,7 @@ impl FederationObserver {
         self.spawn_observer(Federation {
             federation_id,
             config,
-        })
-        .await;
+        });
 
         Ok(federation_id)
     }
@@ -712,9 +718,9 @@ impl FederationObserver {
         let builder = esplora_client::Builder::new(&self.mempool_url);
         let esplora_client = builder.build_async()?;
 
-        // TODO: find a better way to pre-seed the DB so we don't have to bother
-        // blockstream.info Block 820k was mined Dec 2023, afaik there are no
-        // compatible federations older than that
+        // block_times.sql seeds the table on first start, so the fallback only
+        // matters if that seed is ever dropped. Block 820k was mined Dec 2023,
+        // before any compatible federation.
         let next_block_height = self.last_fetched_block_height().await?.unwrap_or(820_000) + 1;
         let current_block_height = esplora_client.get_height().await?;
 
@@ -732,8 +738,7 @@ impl FederationObserver {
             })
             .buffered(4);
 
-        let mut timer = SystemTime::now();
-        let mut last_log_height = next_block_height;
+        let mut progress = SyncProgress::new("block", next_block_height.into());
         while let Some((block_height, block)) = block_stream.next().await.transpose()? {
             self.connection()
                 .await?
@@ -747,22 +752,14 @@ impl FederationObserver {
                     ],
                 )
                 .await?;
-
-            // TODO: write abstraction
-            let elapsed = timer.elapsed().unwrap_or_default();
-            if elapsed >= Duration::from_secs(5) {
-                let blocks_synced = block_height - last_log_height;
-                let rate = (blocks_synced as f64) / elapsed.as_secs_f64();
-                info!("Synced up to block {block_height}, processed {blocks_synced} blocks at a rate of {rate:.2} blocks/s");
-                timer = SystemTime::now();
-                last_log_height = block_height;
-            }
+            progress.record(block_height.into());
         }
 
         Ok(())
     }
 
-    async fn last_fetched_block_height(&self) -> anyhow::Result<Option<u32>> {
+    /// Height of the newest block whose time is stored
+    pub async fn last_fetched_block_height(&self) -> anyhow::Result<Option<u32>> {
         let max_height = query_value::<Option<i32>>(
             &self.connection().await?,
             "SELECT MAX(block_height) AS max_height FROM block_times",
@@ -778,13 +775,7 @@ impl FederationObserver {
         federation_id: FederationId,
         config: ClientConfig,
     ) -> anyhow::Result<()> {
-        let peers = config
-            .global
-            .api_endpoints
-            .iter()
-            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
-            .collect();
-        let api = DynGlobalApi::new(self.connectors.clone(), peers, None)?;
+        let api = federation_api(&self.connectors, &config.global)?;
         let decoders = self.modules.decoders_for_config(&config);
 
         info!("Starting background job for {federation_id}");
@@ -814,8 +805,7 @@ impl FederationObserver {
             })
             .buffered(32);
 
-        let mut timer = SystemTime::now();
-        let mut last_session = next_session;
+        let mut progress = SyncProgress::new("session", next_session);
         while let Some((session_index, signed_session_outcome)) = session_stream.next().await {
             let mut connection = self.connection().await?;
             let dbtx = connection.transaction().await?;
@@ -828,15 +818,7 @@ impl FederationObserver {
             )
             .await?;
             dbtx.commit().await?;
-
-            let elapsed = timer.elapsed().unwrap_or_default();
-            if elapsed >= Duration::from_secs(5) {
-                let sessions_synced = session_index - last_session;
-                let rate = (sessions_synced as f64) / elapsed.as_secs_f64();
-                info!("Synced up to session {session_index}, processed {sessions_synced} sessions at a rate of {rate:.2} sessions/s");
-                timer = SystemTime::now();
-                last_session = session_index;
-            }
+            progress.record(session_index);
         }
 
         unreachable!("Session stream should never end")
@@ -1078,12 +1060,12 @@ impl FederationObserver {
 
     async fn refresh_views(self) {
         loop {
-            let start = SystemTime::now();
+            let start = Instant::now();
             debug!("Refreshing views...");
             if let Err(e) = self.refresh_views_inner().await {
                 warn!("Error while refreshing views: {e:?}");
             }
-            let elapsed = start.elapsed().unwrap_or_default().as_secs_f64();
+            let elapsed = start.elapsed().as_secs_f64();
             info!("Views refresh completed in {elapsed:.2}s. Waiting for next refresh window");
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
@@ -1159,9 +1141,7 @@ impl FederationObserver {
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<GuardianUtxoClaim>> {
         // Unknown ids from the request path must not get a cache slot each
-        self.get_federation(federation_id)
-            .await?
-            .context("Federation not observed")?;
+        self.ensure_observed(federation_id).await?;
         let slot = self
             .guardian_claims_cache
             .lock()
@@ -1192,11 +1172,7 @@ impl FederationObserver {
             .context("Federation not observed")?;
         let config = federation.config;
 
-        let Some(wallet_module_id) = config
-            .modules
-            .iter()
-            .find_map(|(id, module)| (module.kind.as_str() == "wallet").then_some(*id))
-        else {
+        let Some(wallet_module_id) = module_instance_id(&config, "wallet") else {
             return Ok(config
                 .global
                 .api_endpoints
@@ -1211,16 +1187,7 @@ impl FederationObserver {
                 .collect());
         };
 
-        let api = DynGlobalApi::new(
-            self.connectors().clone(),
-            config
-                .global
-                .api_endpoints
-                .iter()
-                .map(|(peer_id, peer_url)| (*peer_id, peer_url.url.clone()))
-                .collect(),
-            None,
-        )?;
+        let api = federation_api(&self.connectors, &config.global)?;
         let module_api = api.with_module(wallet_module_id);
 
         let mut claims = join_all(config.global.api_endpoints.keys().map(|&peer_id| {
@@ -1393,15 +1360,6 @@ impl FederationObserver {
         })
     }
 
-    pub async fn get_block_height(&self) -> anyhow::Result<u32> {
-        Ok(query_value::<i32>(
-            &self.connection().await?,
-            "SELECT MAX(block_height) FROM block_times",
-            &[],
-        )
-        .await? as u32)
-    }
-
     pub async fn get_nonces_spend_info(
         &self,
         federation_id: FederationId,
@@ -1417,10 +1375,7 @@ impl FederationObserver {
             "At most {MAX_NONCES_PER_REQUEST} nonces can be checked per request"
         );
 
-        let _ = self
-            .get_federation(federation_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Federation doesn't exist"))?;
+        self.ensure_observed(federation_id).await?;
 
         #[derive(Debug, FromRow)]
         struct NonceSpendRow {
@@ -1539,6 +1494,36 @@ impl FederationObserver {
 
         info!("Backfill complete!");
         Ok(())
+    }
+}
+
+/// Logs how far a sync got and how fast, at most every 5 s
+struct SyncProgress {
+    unit: &'static str,
+    logged_at: Instant,
+    logged_position: u64,
+}
+
+impl SyncProgress {
+    fn new(unit: &'static str, position: u64) -> Self {
+        SyncProgress {
+            unit,
+            logged_at: Instant::now(),
+            logged_position: position,
+        }
+    }
+
+    fn record(&mut self, position: u64) {
+        let elapsed = self.logged_at.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        let unit = self.unit;
+        let synced = position.saturating_sub(self.logged_position);
+        let rate = synced as f64 / elapsed.as_secs_f64();
+        info!("Synced up to {unit} {position}, processed {synced} {unit}s at a rate of {rate:.2} {unit}s/s");
+        self.logged_at = Instant::now();
+        self.logged_position = position;
     }
 }
 

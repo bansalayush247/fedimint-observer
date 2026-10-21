@@ -53,12 +53,16 @@ pub async fn fetch_federation_gateways(
     Path(invite): Path<InviteCode>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<GatewayInfo>>> {
-    // Reuse the observer's registry: a registry built per request keeps its
-    // guardian connections open after the request ends
-    let connectors = state.federation_observer.connectors();
-    let (config, _api) =
-        fedimint_api_client::download_from_invite_code(connectors, &invite).await?;
-    let gateways = fetch_gateways_for_config(connectors, &config).await?;
+    let config = state
+        .federation_config_cache
+        .fetch_config_cached(&invite, &state.federation_observer)
+        .await?;
+    let gateways = tokio::time::timeout(
+        INVITE_FETCH_TIMEOUT,
+        fetch_gateways_for_config(state.federation_observer.connectors(), &config),
+    )
+    .await
+    .context("Timed out fetching the federation's gateways")??;
     Ok(gateways.into())
 }
 
@@ -96,9 +100,9 @@ impl FederationConfigCache {
 
 /// Federations anyone can ask about through an invite code
 const MAX_CACHED_CONFIGS: usize = 256;
-/// The invite code names the servers to contact, so it can name unreachable
-/// ones; the client retries each of them
-const CONFIG_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Invite codes name the servers to contact, so they can name unreachable
+/// ones, which the client keeps retrying
+const INVITE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 async fn fetch_config_inner(
     invite: &InviteCode,
@@ -107,7 +111,7 @@ async fn fetch_config_inner(
     // Reuse the observer's registry: a registry built per request keeps its
     // guardian connections open after the request ends
     let (raw_config, _api) = tokio::time::timeout(
-        CONFIG_FETCH_TIMEOUT,
+        INVITE_FETCH_TIMEOUT,
         fedimint_api_client::download_from_invite_code(observer.connectors(), invite),
     )
     .await

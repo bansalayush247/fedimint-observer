@@ -1,5 +1,10 @@
 use deadpool_postgres::GenericClient;
-use fedimint_core::config::{ClientConfig, ClientModuleConfig, JsonClientConfig, JsonWithKind};
+use fedimint_api_client::api::DynGlobalApi;
+use fedimint_connectors::ConnectorRegistry;
+use fedimint_core::config::{
+    ClientConfig, ClientModuleConfig, GlobalClientConfig, JsonClientConfig, JsonWithKind,
+};
+use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::DynRawFallback;
 use hex::ToHex;
 use postgres_from_row::FromRow;
@@ -19,6 +24,27 @@ where
             map.remove(&key);
         }
     }
+}
+
+/// A client for the API of a federation's guardians
+pub fn federation_api(
+    connectors: &ConnectorRegistry,
+    global: &GlobalClientConfig,
+) -> anyhow::Result<DynGlobalApi> {
+    let peers = global
+        .api_endpoints
+        .iter()
+        .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
+        .collect();
+    DynGlobalApi::new(connectors.clone(), peers, None)
+}
+
+/// The instance id of the federation's first module of `kind`
+pub fn module_instance_id(config: &ClientConfig, kind: &str) -> Option<ModuleInstanceId> {
+    config
+        .modules
+        .iter()
+        .find_map(|(&instance_id, module)| (module.kind.as_str() == kind).then_some(instance_id))
 }
 
 pub fn config_to_json(
@@ -59,15 +85,6 @@ pub fn config_to_json(
             )
             .collect(),
     })
-}
-
-pub async fn execute(
-    conn: &impl GenericClient,
-    sql: &str,
-    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-) -> anyhow::Result<u64> {
-    let num_rows = conn.execute(sql, params).await?;
-    Ok(num_rows)
 }
 
 pub async fn query_one<T>(

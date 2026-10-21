@@ -8,7 +8,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
 use fedimint_connectors::ConnectorRegistry;
-use fedimint_core::config::{ClientConfig, FederationId};
+use fedimint_core::config::{ClientConfig, FederationId, JsonClientConfig};
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::Encodable;
 use fedimint_core::module::ApiRequestErased;
@@ -23,7 +23,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::federation::observer::FederationObserver;
-use crate::util::query;
+use crate::util::{federation_api, module_instance_id, query};
 
 const GATEWAY_POLL_INTERVAL_MINUTES: u64 = 5;
 const GATEWAY_SNAPSHOT_RETENTION_DAYS: i64 = 90;
@@ -102,61 +102,26 @@ pub(super) struct GetFederationGatewaysParams {
     include: Option<String>,
 }
 
+/// Registered gateways a federation's guardians currently announce. Each
+/// guardian keeps its own registry, so this is the union across all of them.
 pub(crate) async fn fetch_gateways_for_config(
     connectors: &ConnectorRegistry,
-    config: &ClientConfig,
+    config: &JsonClientConfig,
 ) -> anyhow::Result<Vec<GatewayInfo>> {
-    let peers = config
-        .global
-        .api_endpoints
-        .iter()
-        .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
-        .collect();
-    let api = DynGlobalApi::new(connectors.clone(), peers, None)?;
-
+    let api = federation_api(connectors, &config.global)?;
     let ln_instance_id = config
         .modules
         .iter()
-        .find_map(|(&instance_id, module)| (module.kind.as_str() == "ln").then_some(instance_id))
+        .find_map(|(&instance_id, module)| (module.kind().as_str() == "ln").then_some(instance_id))
         .context("No LN module found in federation config")?;
+    let peer_ids = config
+        .global
+        .api_endpoints
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
 
-    let peer_ids: Vec<fedimint_core::PeerId> =
-        config.global.api_endpoints.keys().copied().collect();
-    let mut merged: HashMap<String, LightningGatewayAnnouncement> = HashMap::new();
-    let peer_results = join_all(peer_ids.iter().copied().map(|peer_id| {
-        let api = api.clone();
-        async move {
-            let result: anyhow::Result<Vec<LightningGatewayAnnouncement>> = api
-                .with_module(ln_instance_id)
-                .request_single_peer(
-                    LIST_GATEWAYS_ENDPOINT.to_owned(),
-                    ApiRequestErased::default(),
-                    peer_id,
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|v| serde_json::from_value(v).map_err(anyhow::Error::from));
-            (peer_id, result)
-        }
-    }))
-    .await;
-
-    for (peer_id, result) in peer_results {
-        match result {
-            Ok(gateways) => {
-                for gw in gateways {
-                    merged.entry(gw.info.gateway_id.to_string()).or_insert(gw);
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to fetch live gateways from peer {}: {:?}",
-                    peer_id, e
-                );
-            }
-        }
-    }
-
+    let (merged, _) = fetch_gateway_announcements(&api, ln_instance_id, &peer_ids).await;
     merged
         .into_values()
         .map(|gw| {
@@ -179,6 +144,44 @@ pub(crate) async fn fetch_gateways_for_config(
         .collect()
 }
 
+/// Gateway announcements of every guardian merged by gateway id, and how many
+/// guardians answered
+async fn fetch_gateway_announcements(
+    api: &DynGlobalApi,
+    ln_instance_id: ModuleInstanceId,
+    peer_ids: &[fedimint_core::PeerId],
+) -> (HashMap<String, LightningGatewayAnnouncement>, u32) {
+    let peer_results = join_all(peer_ids.iter().copied().map(|peer_id| async move {
+        let result: anyhow::Result<Vec<LightningGatewayAnnouncement>> = api
+            .with_module(ln_instance_id)
+            .request_single_peer(
+                LIST_GATEWAYS_ENDPOINT.to_owned(),
+                ApiRequestErased::default(),
+                peer_id,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|v| serde_json::from_value(v).map_err(anyhow::Error::from));
+        (peer_id, result)
+    }))
+    .await;
+
+    let mut merged = HashMap::new();
+    let mut successful_peer_queries = 0;
+    for (peer_id, result) in peer_results {
+        match result {
+            Ok(gateways) => {
+                successful_peer_queries += 1;
+                for gw in gateways {
+                    merged.entry(gw.info.gateway_id.to_string()).or_insert(gw);
+                }
+            }
+            Err(e) => warn!("Failed to fetch gateways from peer {peer_id}: {e:?}"),
+        }
+    }
+    (merged, successful_peer_queries)
+}
+
 impl FederationObserver {
     /// Background task: poll the LN module on this federation for currently
     /// registered gateways and persist them. Runs in a loop until cancelled.
@@ -189,21 +192,9 @@ impl FederationObserver {
     ) -> anyhow::Result<()> {
         const POLL_INTERVAL: Duration = Duration::from_secs(GATEWAY_POLL_INTERVAL_MINUTES * 60);
 
-        let peers = config
-            .global
-            .api_endpoints
-            .iter()
-            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
-            .collect();
-        let api = DynGlobalApi::new(self.connectors().clone(), peers, None)?;
-
-        let ln_instance_id = config
-            .modules
-            .iter()
-            .find_map(|(&instance_id, module)| {
-                (module.kind.as_str() == "ln").then_some(instance_id)
-            })
-            .context("No LN module found in federation config")?;
+        let api = federation_api(self.connectors(), &config.global)?;
+        let ln_instance_id =
+            module_instance_id(&config, "ln").context("No LN module found in federation config")?;
 
         let peer_ids: Vec<fedimint_core::PeerId> =
             config.global.api_endpoints.keys().copied().collect();
@@ -230,42 +221,8 @@ impl FederationObserver {
         ln_instance_id: ModuleInstanceId,
         peer_ids: &[fedimint_core::PeerId],
     ) -> anyhow::Result<()> {
-        // Query all peers and merge by gateway_id — each guardian has their own
-        // registry so we take the union across all peers.
-        let mut merged: HashMap<String, LightningGatewayAnnouncement> = HashMap::new();
-        let mut successful_peer_queries: u32 = 0;
-        let peer_results = join_all(peer_ids.iter().copied().map(|peer_id| async move {
-            let result: anyhow::Result<Vec<LightningGatewayAnnouncement>> = api
-                .with_module(ln_instance_id)
-                .request_single_peer(
-                    LIST_GATEWAYS_ENDPOINT.to_owned(),
-                    ApiRequestErased::default(),
-                    peer_id,
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|v| serde_json::from_value(v).map_err(anyhow::Error::from));
-            (peer_id, result)
-        }))
-        .await;
-
-        for (peer_id, result) in peer_results {
-            match result {
-                Ok(gateways) => {
-                    successful_peer_queries += 1;
-                    for gw in gateways {
-                        merged.entry(gw.info.gateway_id.to_string()).or_insert(gw);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to fetch gateways from peer {} for {}: {:?}",
-                        peer_id, federation_id, e
-                    );
-                }
-            }
-        }
-
+        let (merged, successful_peer_queries) =
+            fetch_gateway_announcements(api, ln_instance_id, peer_ids).await;
         if successful_peer_queries == 0 {
             bail!(
                 "No successful gateway registry responses from any federation peer for {}",
@@ -695,11 +652,7 @@ impl FederationObserver {
                 let offline_minutes = total_samples
                     .saturating_sub(seen_samples)
                     .saturating_mul(GATEWAY_POLL_INTERVAL_MINUTES);
-                let uptime_pct = if total_samples > 0 {
-                    (seen_samples as f64 / total_samples as f64) * 100.0
-                } else {
-                    0.0
-                };
+                let uptime_pct = uptime_pct(seen_samples, total_samples);
                 (
                     row.gateway_id,
                     GatewayUptimeMetrics {
@@ -785,11 +738,7 @@ impl FederationObserver {
             .map(|row| {
                 let seen_samples = row.seen_samples.max(0) as u64;
                 let total_samples = row.total_samples.max(0) as u64;
-                let uptime_pct = if total_samples == 0 {
-                    0.0
-                } else {
-                    (seen_samples as f64 / total_samples as f64) * 100.0
-                };
+                let uptime_pct = uptime_pct(seen_samples, total_samples);
                 GatewayUptimeTrendPoint {
                     day: row.day,
                     seen_samples,
@@ -798,6 +747,14 @@ impl FederationObserver {
                 }
             })
             .collect())
+    }
+}
+
+fn uptime_pct(seen_samples: u64, total_samples: u64) -> f64 {
+    if total_samples == 0 {
+        0.0
+    } else {
+        (seen_samples as f64 / total_samples as f64) * 100.0
     }
 }
 

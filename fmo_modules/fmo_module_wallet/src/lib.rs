@@ -1,8 +1,6 @@
 //! Observes the wallet module: peg-ins, peg-outs and the guardians' block
 //! height votes that date every session
 
-use std::str::FromStr;
-
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use bitcoin::hashes::Hash;
@@ -11,6 +9,7 @@ use fedimint_core::encoding::Encodable;
 use fedimint_core::module::CommonModuleInit;
 use fedimint_core::util::backoff_util::aggressive_backoff;
 use fedimint_core::util::retry;
+use fedimint_core::NumPeers;
 use fedimint_wallet_common::{
     WalletCommonInit, WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0,
 };
@@ -180,7 +179,7 @@ impl ObserverModule for WalletObserver {
                 .await?;
             }
             WalletConsensusItem::PegOutSignature(peg_out_sig) => {
-                let peg_out_txid = peg_out_sig.txid.to_string();
+                let peg_out_txid = peg_out_sig.txid;
                 let peg_out_txid_encoded = peg_out_sig.txid.to_byte_array().to_vec();
 
                 dbtx.execute(
@@ -216,13 +215,7 @@ impl ObserverModule for WalletObserver {
                     .await?
                     .get::<_, i32>("num_sigs") as usize;
 
-                // 3n + 1 <= num_peers
-                // n <= (num_peers - 1) / 3
-                // threshold = num_peers - floor((num_peers - 1) / 3)
-                let threshold = {
-                    let num_peers = ctx.config.global.api_endpoints.len();
-                    num_peers - (num_peers - 1) / 3
-                };
+                let threshold = NumPeers::from(ctx.config.global.api_endpoints.len()).threshold();
 
                 if num_sigs < threshold {
                     return Ok(());
@@ -240,9 +233,6 @@ impl ObserverModule for WalletObserver {
                     return Ok(());
                 }
 
-                let esplora_txid = esplora_client::Txid::from_str(peg_out_txid.as_str())
-                    .context("Couldn't create esplora txid")?;
-
                 let builder = esplora_client::Builder::new(ctx.mempool_url);
                 let client = builder
                     .build_async()
@@ -255,7 +245,7 @@ impl ObserverModule for WalletObserver {
                     "fetching tx from esplora".to_string(),
                     aggressive_backoff(),
                     || async {
-                        client.get_tx_no_opt(&esplora_txid).await.map_err(|e| {
+                        client.get_tx_no_opt(&peg_out_txid).await.map_err(|e| {
                             warn!("failed to fetch tx: {e:?}");
                             anyhow::anyhow!("failed fetching tx from esplora")
                         })
@@ -280,7 +270,7 @@ impl ObserverModule for WalletObserver {
 
                 for (out_idx, output) in fetched_tx.output.iter().enumerate() {
                     let address = bitcoin::Address::from_script(
-                        bitcoin::Script::from_bytes(output.script_pubkey.as_bytes()),
+                        &output.script_pubkey,
                         bitcoin::Network::Bitcoin,
                     )
                     .context("Peg-out output has no address")?;
@@ -298,7 +288,7 @@ impl ObserverModule for WalletObserver {
                 }
             }
             _ => {
-                // other WalletConsesnsusItems are not needed yet
+                // other WalletConsensusItems are not needed yet
             }
         }
 

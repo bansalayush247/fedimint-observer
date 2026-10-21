@@ -32,28 +32,6 @@ impl FromRow for Federation {
     }
 }
 
-/// A stored transaction, decoded with the fallback decoder only: module items
-/// stay undecoded until the caller decodes them with the module decoders
-pub struct Transaction {
-    pub data: fedimint_core::transaction::Transaction,
-}
-
-impl FromRow for crate::federation::db::Transaction {
-    fn from_row(row: &Row) -> Self {
-        Self::try_from_row(row).expect("Decoding row failed")
-    }
-
-    fn try_from_row(row: &Row) -> Result<Self, Error> {
-        let decoder = ModuleDecoderRegistry::default().with_fallback();
-        let data_bytes: Vec<u8> = row.try_get("data")?;
-        let data =
-            fedimint_core::transaction::Transaction::consensus_decode_whole(&data_bytes, &decoder)
-                .expect("Invalid data in DB");
-
-        Ok(crate::federation::db::Transaction { data })
-    }
-}
-
 #[derive(Debug)]
 pub struct SessionOutcome {
     pub session_index: i32,
@@ -61,10 +39,6 @@ pub struct SessionOutcome {
 }
 
 impl SessionOutcome {
-    pub fn from_row_with_decoders(row: &Row, decoders: &ModuleDecoderRegistry) -> Self {
-        Self::try_from_row_with_decoders(row, decoders).expect("Decoding row failed")
-    }
-
     pub fn try_from_row_with_decoders(
         row: &Row,
         decoders: &ModuleDecoderRegistry,

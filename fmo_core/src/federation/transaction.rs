@@ -1,21 +1,19 @@
 use std::collections::BTreeMap;
-use std::io::Cursor;
 
 use anyhow::Context;
 use axum::extract::{Path, State};
 use axum::Json;
 use chrono::NaiveDate;
 use fedimint_core::config::FederationId;
-use fedimint_core::core::{DynInput, DynOutput, DynUnknown};
+use fedimint_core::core::{DynUnknown, ModuleInstanceId};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::{Amount, TransactionId};
 use fmo_api_types::FederationActivity;
 use postgres_from_row::FromRow;
 use serde::Serialize;
 
-use crate::federation::db;
 use crate::federation::observer::FederationObserver;
-use crate::util::{query, query_one, query_value};
+use crate::util::{query, query_value};
 use crate::AppState;
 
 pub(super) async fn list_transactions(
@@ -78,9 +76,7 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<TransactionId>> {
-        self.get_federation(federation_id)
-            .await?
-            .context("Federation doesn't exist")?;
+        self.ensure_observed(federation_id).await?;
 
         // Only the ids: decoding every transaction blob of a large federation
         // (hundreds of MB) just to drop it was most of this endpoint's cost
@@ -105,13 +101,11 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<u64> {
-        self.get_federation(federation_id)
-            .await?
-            .context("Federation doesn't exist")?;
+        self.ensure_observed(federation_id).await?;
 
         Ok(query_value::<i64>(
             &self.connection().await?,
-            "SELECT COALESCE(COUNT(txid), 0) FROM transactions WHERE federation_id = $1",
+            "SELECT COUNT(txid) FROM transactions WHERE federation_id = $1",
             &[&federation_id.consensus_encode_to_vec()],
         )
         .await? as u64)
@@ -128,7 +122,7 @@ impl FederationObserver {
             .context("Federation doesn't exist")?
             .config;
 
-        let tx = query_one::<db::Transaction>(
+        let data = query_value::<Vec<u8>>(
             &self.connection().await?,
             "SELECT data FROM transactions WHERE federation_id = $1 AND txid = $2",
             &[
@@ -136,63 +130,42 @@ impl FederationObserver {
                 &transaction_id.consensus_encode_to_vec(),
             ],
         )
-        .await?;
-
-        let decoders = self.modules().decoders_for_config(&cfg);
-
+        .await
+        .context("Transaction not found")?;
+        // Items of modules this build doesn't include decode as `DynUnknown`
+        let tx = fedimint_core::transaction::Transaction::consensus_decode_whole(
+            &data,
+            &self.modules().decoders_for_config(&cfg),
+        )?;
+        let describe = |item: &dyn std::any::Any, instance: ModuleInstanceId, debug: String| {
+            if item.is::<DynUnknown>() {
+                format!("Unknown module, instance id={instance}")
+            } else {
+                debug
+            }
+        };
         let inputs = tx
-            .data
             .inputs
-            .into_iter()
+            .iter()
             .map(|input| {
-                let module_instance_id = input.module_instance_id();
-                let undecoded = input
-                    .as_any()
-                    .downcast_ref::<DynUnknown>()
-                    .expect("Shouldn't be decoded yet");
-                decoders
-                    .get(module_instance_id)
-                    .map(|decoder| {
-                        decoder
-                            .decode_complete::<DynInput>(
-                                &mut Cursor::new(&undecoded.0),
-                                undecoded.0.len() as u64,
-                                module_instance_id,
-                                &Default::default(),
-                            )
-                            .expect("decoding failed")
-                    })
-                    .map(|input| format!("{input:?}"))
-                    .unwrap_or_else(|| format!("Unknown module, instance id={module_instance_id}"))
+                describe(
+                    input.as_any(),
+                    input.module_instance_id(),
+                    format!("{input:?}"),
+                )
             })
-            .collect::<Vec<_>>();
-
+            .collect();
         let outputs = tx
-            .data
             .outputs
-            .into_iter()
+            .iter()
             .map(|output| {
-                let module_instance_id = output.module_instance_id();
-                let undecoded = output
-                    .as_any()
-                    .downcast_ref::<DynUnknown>()
-                    .expect("Shouldn't be decoded yet");
-                decoders
-                    .get(module_instance_id)
-                    .map(|decoder| {
-                        decoder
-                            .decode_complete::<DynOutput>(
-                                &mut Cursor::new(&undecoded.0),
-                                undecoded.0.len() as u64,
-                                module_instance_id,
-                                &Default::default(),
-                            )
-                            .expect("decoding failed")
-                    })
-                    .map(|output| format!("{output:?}"))
-                    .unwrap_or_else(|| format!("Unknown module, instance id={module_instance_id}"))
+                describe(
+                    output.as_any(),
+                    output.module_instance_id(),
+                    format!("{output:?}"),
+                )
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         Ok(DebugTransaction { inputs, outputs })
     }
@@ -222,11 +195,7 @@ impl FederationObserver {
             ORDER BY date;
         ";
 
-        // Check federation exists
-        let _federation = self
-            .get_federation(federation_id)
-            .await?
-            .context("Federation doesn't exist")?;
+        self.ensure_observed(federation_id).await?;
 
         let histogram = query::<HistogramEntry>(
             &self.connection().await?,

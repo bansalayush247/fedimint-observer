@@ -5,7 +5,6 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail, ensure, Context};
 use axum::extract::{Path, State};
 use axum::Json;
-use fedimint_api_client::api::DynGlobalApi;
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::{FederationId, JsonClientConfig};
 use fedimint_core::invite_code::InviteCode;
@@ -16,7 +15,7 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::meta::federation_meta;
-use crate::util::make_room;
+use crate::util::{federation_api, make_room};
 use crate::AppState;
 
 pub type MetaFields = BTreeMap<String, serde_json::Value>;
@@ -208,13 +207,7 @@ impl ConsensusMetaCache {
 
         // Reuse the observer's registry: one built per refresh keeps its
         // guardian connections open
-        let peers = config
-            .global
-            .api_endpoints
-            .iter()
-            .map(|(peer_id, peer)| (*peer_id, peer.url.clone()))
-            .collect();
-        let api_client = DynGlobalApi::new(connectors.clone(), peers, None)?;
+        let api_client = federation_api(connectors, &config.global)?;
 
         let module_api = api_client.with_module(*meta_instance_id);
 

@@ -31,7 +31,7 @@ use serde_json::json;
 use crate::federation::gateways::get_federation_gateway_overview;
 use crate::federation::guardians::get_federation_health;
 use crate::federation::meta::get_federation_meta;
-use crate::federation::observer::OnChainOutput;
+use crate::federation::observer::{FederationObserver, OnChainOutput};
 use crate::federation::session::{count_sessions, list_sessions};
 use crate::federation::transaction::{
     count_transactions, list_transactions, transaction, transaction_histogram,
@@ -111,16 +111,24 @@ pub(crate) async fn get_federation_config(
     Path(federation_id): Path<FederationId>,
     State(state): State<AppState>,
 ) -> crate::error::Result<Json<JsonClientConfig>> {
-    let observer = &state.federation_observer;
-    Ok(config_to_json(
-        observer
-            .get_federation(federation_id)
+    Ok(
+        observed_config_json(&state.federation_observer, federation_id)
             .await?
-            .context("Federation not observed, you might want to try /config/:federation_invite")?
-            .config,
-        observer.modules(),
-    )?
-    .into())
+            .into(),
+    )
+}
+
+/// The config of an observed federation, decoded with this build's modules
+pub(crate) async fn observed_config_json(
+    observer: &FederationObserver,
+    federation_id: FederationId,
+) -> anyhow::Result<JsonClientConfig> {
+    let config = observer
+        .get_federation(federation_id)
+        .await?
+        .context("Federation not observed, you might want to try /config/:federation_invite")?
+        .config;
+    config_to_json(config, observer.modules())
 }
 
 async fn get_federation_overview(

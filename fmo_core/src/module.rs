@@ -166,7 +166,7 @@ impl ModuleRegistry {
 
     /// Decoders for the given module instances; instances of kinds this build
     /// doesn't include stay undecoded
-    pub fn decoders(
+    fn decoders(
         &self,
         modules: impl IntoIterator<Item = (ModuleInstanceId, ModuleKind)>,
     ) -> ModuleDecoderRegistry {

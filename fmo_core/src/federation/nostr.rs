@@ -29,14 +29,19 @@ use crate::AppState;
 const FEDERATION_ANNOUNCEMENT_EVENT_KIND: Kind = Kind::Custom(38173);
 const RECOMMENDATION_EVENT_KIND: Kind = Kind::Custom(38000);
 
+/// Both event kinds name their federation in a `d` tag
+fn federation_id_tag() -> SingleLetterTag {
+    SingleLetterTag::from_char('d').expect("Tag is valid")
+}
+
 #[derive(Debug, Clone, FromRow)]
 struct NostrRelay {
     relay_url: String,
 }
 
 impl FederationObserver {
-    /// Syncs Nostr events:
-    ///   * Fedimint federation votes
+    /// Syncs federation announcements, and the votes on announced and
+    /// observed federations
     pub async fn sync_nostr_events(self) {
         const SLEEP_SECS: u64 = 60;
         loop {
@@ -165,10 +170,10 @@ impl FederationObserver {
     }
 
     pub async fn list_nostr_federations(&self) -> anyhow::Result<Vec<NostrFederation>> {
-        #[derive(Debug, Clone, FromRow)]
-        pub struct RawNostrFederation {
-            pub federation_id: Vec<u8>,
-            pub invite_code: String,
+        #[derive(FromRow)]
+        struct RawNostrFederation {
+            federation_id: Vec<u8>,
+            invite_code: String,
         }
 
         query::<RawNostrFederation>(
@@ -260,7 +265,7 @@ impl FederationObserver {
     }
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct NostrFederation {
     pub federation_id: FederationId,
     pub invite_code: InviteCode,
@@ -288,13 +293,13 @@ impl TryFrom<Event> for ParsedFederationEvent {
         let event_id = event.id.to_bytes();
 
         let federation_invite_tag = SingleLetterTag::from_char('u').expect("Tag is valid");
-        let federation_id_tag = SingleLetterTag::from_char('d').expect("Tag is valid");
+        let id_tag = federation_id_tag();
 
         let federation_id = event
             .tags()
             .iter()
             .find_map(|tag| {
-                if tag.single_letter_tag() != Some(federation_id_tag) {
+                if tag.single_letter_tag() != Some(id_tag) {
                     return None;
                 }
 
@@ -312,7 +317,7 @@ impl TryFrom<Event> for ParsedFederationEvent {
 
                 tag.as_vec().get(1)?.parse::<InviteCode>().ok()
             })
-            .context("No federation id tag found")?;
+            .context("No invite code tag found")?;
 
         ensure!(
             invite_code.federation_id() == federation_id,
@@ -344,8 +349,7 @@ impl TryFrom<Event> for ParsedRecommendationEvent {
         );
         event.verify().context("Invalid Nostr event signature")?;
 
-        // TODO: make constant
-        let federation_tag = SingleLetterTag::from_char('d').expect("Tag is valid");
+        let federation_tag = federation_id_tag();
 
         let event_id = event.id.to_bytes();
 
@@ -426,7 +430,7 @@ async fn fetch_federation_votes(
     client: &RelayPool,
     federation_id: FederationId,
 ) -> anyhow::Result<Vec<Event>> {
-    let federation_tag = SingleLetterTag::from_char('d').expect("Tag is valid");
+    let federation_tag = federation_id_tag();
 
     let events = client
         .get_events_of(

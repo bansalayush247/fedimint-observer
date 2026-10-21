@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context};
 use axum::extract::{Path, State};
 use axum::Json;
-use fedimint_api_client::api::{DynGlobalApi, FederationApiExt, StatusResponse};
+use fedimint_api_client::api::{FederationApiExt, StatusResponse};
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::encoding::Encodable;
 use fedimint_core::endpoint_constants::STATUS_ENDPOINT;
@@ -16,7 +16,7 @@ use futures::future::join_all;
 use postgres_from_row::FromRow;
 
 use crate::federation::observer::FederationObserver;
-use crate::util::query;
+use crate::util::{federation_api, module_instance_id, query};
 
 impl FederationObserver {
     pub async fn monitor_health(
@@ -27,21 +27,9 @@ impl FederationObserver {
         const REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 
         let mut interval = tokio::time::interval(REQUEST_INTERVAL);
-        let peers = config
-            .global
-            .api_endpoints
-            .iter()
-            .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
-            .collect();
-        let api = DynGlobalApi::new(self.connectors().clone(), peers, None)?;
-
-        let wallet_module = config
-            .modules
-            .iter()
-            .find_map(|(&module_instance_id, module)| {
-                (module.kind.as_str() == "wallet").then_some(module_instance_id)
-            })
-            .context("Wallet module not found")?;
+        let api = federation_api(self.connectors(), &config.global)?;
+        let wallet_module =
+            module_instance_id(&config, "wallet").context("Wallet module not found")?;
 
         loop {
             interval.tick().await;
@@ -132,10 +120,7 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<BTreeMap<PeerId, GuardianHealth>> {
-        let _federation = self
-            .get_federation(federation_id)
-            .await?
-            .context("Unknown federation")?;
+        self.ensure_observed(federation_id).await?;
 
         let health_rows = query::<GuardianHealthRow>(
             &self.connection().await?,
@@ -194,7 +179,10 @@ impl FederationObserver {
         )
         .await?;
 
-        let our_block_height = self.get_block_height().await?;
+        let our_block_height = self
+            .last_fetched_block_height()
+            .await?
+            .context("No block times stored yet")?;
         let max_session = health_rows
             .iter()
             .filter_map(|row| row.session_count)
