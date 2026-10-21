@@ -26,7 +26,7 @@ where
             Ok(Err(error)) => error,
             Err(panic) => anyhow::anyhow!("panicked: {}", panic_message(&*panic)),
         };
-        error!("{name} errored, restarting in 30s: {error}");
+        error!("{name} errored, restarting in 30s: {error:#}");
         tokio::time::sleep(RESTART_DELAY).await;
     }
 }
