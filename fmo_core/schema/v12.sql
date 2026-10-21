@@ -229,6 +229,12 @@ ON CONFLICT (federation_id) DO UPDATE
 -- The health page averaged the last 30 days of raw samples (one per guardian
 -- per minute) on every load. Hours fully inside the window are read from
 -- here. Raw samples are kept as they are.
+
+-- Seconds until the next poll of the federation, since fully offline
+-- federations are polled less often. Samples from before this migration,
+-- when every poll was a minute apart, stay NULL and count as 60.
+ALTER TABLE guardian_health ADD COLUMN poll_interval_s INTEGER;
+
 CREATE TABLE guardian_health_hourly (
     federation_id BYTEA NOT NULL REFERENCES federations (federation_id),
     guardian_id INTEGER NOT NULL,
@@ -238,6 +244,10 @@ CREATE TABLE guardian_health_hourly (
     online_samples INTEGER NOT NULL,
     latency_samples INTEGER NOT NULL,
     latency_sum_ms BIGINT NOT NULL,
+    -- Seconds the samples stand for, and of those the seconds of samples
+    -- where the guardian answered: uptime weights samples by their interval
+    polled_s BIGINT NOT NULL,
+    online_s BIGINT NOT NULL,
     PRIMARY KEY (federation_id, guardian_id, hour)
 );
 
@@ -251,13 +261,17 @@ BEGIN
         1,
         (NEW.status IS NOT NULL)::int,
         (NEW.latency_ms IS NOT NULL)::int,
-        COALESCE(NEW.latency_ms, 0)
+        COALESCE(NEW.latency_ms, 0),
+        COALESCE(NEW.poll_interval_s, 60),
+        CASE WHEN NEW.status IS NOT NULL THEN COALESCE(NEW.poll_interval_s, 60) ELSE 0 END
     )
     ON CONFLICT (federation_id, guardian_id, hour) DO UPDATE
         SET samples = guardian_health_hourly.samples + 1,
             online_samples = guardian_health_hourly.online_samples + EXCLUDED.online_samples,
             latency_samples = guardian_health_hourly.latency_samples + EXCLUDED.latency_samples,
-            latency_sum_ms = guardian_health_hourly.latency_sum_ms + EXCLUDED.latency_sum_ms;
+            latency_sum_ms = guardian_health_hourly.latency_sum_ms + EXCLUDED.latency_sum_ms,
+            polled_s = guardian_health_hourly.polled_s + EXCLUDED.polled_s,
+            online_s = guardian_health_hourly.online_s + EXCLUDED.online_s;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -274,7 +288,9 @@ SELECT federation_id,
        COUNT(*),
        COUNT(status),
        COUNT(latency_ms),
-       COALESCE(SUM(latency_ms), 0)
+       COALESCE(SUM(latency_ms), 0),
+       COUNT(*) * 60,
+       COUNT(status) * 60
 FROM guardian_health
 WHERE time >= date_trunc('hour', NOW()::timestamp - INTERVAL '31 days')
 GROUP BY 1, 2, 3;

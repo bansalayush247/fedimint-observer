@@ -106,5 +106,5 @@ PostgreSQL. Key tables:
 Read models, kept current as data is written so requests never aggregate the full history (v9, v12):
 - `session_times`, `federation_daily_activity` - written per new session by `record_new_session()`, in the session's transaction; `rebuild_read_models()` after reprocessing stored sessions
 - `federation_totals` - transaction, volume and wallet counters, by triggers on inserts
-- `guardian_health_hourly` - by a trigger on `guardian_health`; readers add the partial first hour from raw rows
+- `guardian_health_hourly` - by a trigger on `guardian_health`; readers add the partial first hour from raw rows. Uptime weights samples by `poll_interval_s`, since fully offline federations are polled less often
 - `utxos` - materialized view, refreshed every minute
