@@ -6,8 +6,9 @@
 //! For every item it first asks the owning module for a summary (amount and
 //! JSON details), writes its own row from it, and then lets the module write
 //! its own tables. Items of modules this build doesn't include are stored with
-//! their kind and no amount or details, so a build with that module can
-//! process them later.
+//! their kind and no amount or details. Adding the module to a build later
+//! doesn't fill those in yet: core rows are written once (`ON CONFLICT DO
+//! NOTHING`), so that needs the replay of a later step of issue #8.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,12 +23,13 @@ use fedimint_core::{PeerId, TransactionId};
 
 /// The database transaction a session is processed in
 pub type DbTransaction<'a> = deadpool_postgres::Transaction<'a>;
-pub type DbError = tokio_postgres::Error;
 
 /// Where a transaction input or output sits
 #[derive(Debug, Clone, Copy)]
 pub struct ItemMeta {
     pub federation_id: FederationId,
+    /// Federations can run several instances of the same module kind
+    pub module_instance_id: ModuleInstanceId,
     pub txid: TransactionId,
     pub session_index: u64,
     pub item_index: u64,
@@ -39,6 +41,7 @@ pub struct ItemMeta {
 #[derive(Debug, Clone, Copy)]
 pub struct CiMeta {
     pub federation_id: FederationId,
+    pub module_instance_id: ModuleInstanceId,
     pub session_index: u64,
     pub item_index: u64,
     pub peer: PeerId,
@@ -100,7 +103,7 @@ pub trait ObserverModule: Send + Sync + 'static {
         _meta: &ItemMeta,
         _input: &DynInput,
         _summary: &InputSummary,
-    ) -> Result<(), DbError> {
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -110,7 +113,7 @@ pub trait ObserverModule: Send + Sync + 'static {
         _meta: &ItemMeta,
         _output: &DynOutput,
         _summary: &OutputSummary,
-    ) -> Result<(), DbError> {
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -119,7 +122,7 @@ pub trait ObserverModule: Send + Sync + 'static {
         _ctx: &ProcessCtx<'_>,
         _meta: &CiMeta,
         _ci: &DynModuleConsensusItem,
-    ) -> Result<(), DbError> {
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }

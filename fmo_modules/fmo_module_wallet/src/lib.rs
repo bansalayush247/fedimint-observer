@@ -14,8 +14,7 @@ use fedimint_wallet_common::{
     WalletCommonInit, WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0,
 };
 use fmo_core::module::{
-    details_json, CiMeta, DbError, InputSummary, ItemMeta, ObserverModule, OutputSummary,
-    ProcessCtx,
+    details_json, CiMeta, InputSummary, ItemMeta, ObserverModule, OutputSummary, ProcessCtx,
 };
 use tracing::warn;
 
@@ -85,7 +84,7 @@ impl ObserverModule for WalletObserver {
         meta: &ItemMeta,
         input: &DynInput,
         summary: &InputSummary,
-    ) -> Result<(), DbError> {
+    ) -> anyhow::Result<()> {
         let (outpoint, script) = match wallet_input(input) {
             WalletInput::V0(peg_in_proof) => {
                 let outpoint = peg_in_proof.outpoint();
@@ -127,7 +126,7 @@ impl ObserverModule for WalletObserver {
         meta: &ItemMeta,
         output: &DynOutput,
         _summary: &OutputSummary,
-    ) -> Result<(), DbError> {
+    ) -> anyhow::Result<()> {
         match v0_output(output) {
             WalletOutputV0::PegOut(_) => {}
             WalletOutputV0::Rbf(_) => {
@@ -162,7 +161,7 @@ impl ObserverModule for WalletObserver {
         ctx: &ProcessCtx<'_>,
         meta: &CiMeta,
         ci: &DynModuleConsensusItem,
-    ) -> Result<(), DbError> {
+    ) -> anyhow::Result<()> {
         let dbtx = ctx.dbtx;
         let wallet_ci = ci
             .as_any()

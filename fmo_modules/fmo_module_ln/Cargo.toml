@@ -5,6 +5,7 @@ edition = "2021"
 description = "Fedimint Observer support for the Lightning (v1) module"
 
 [dependencies]
+anyhow = "1.0.81"
 async-trait = "0.1.92"
 fedimint-core = { workspace = true }
 fedimint-ln-common = { workspace = true }

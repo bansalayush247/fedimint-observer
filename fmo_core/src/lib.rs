@@ -84,7 +84,8 @@ pub struct FedimintObserverBuilder {
 
 impl FedimintObserverBuilder {
     /// Decode and process this module's items. Items of modules a build
-    /// doesn't include are stored without amounts or details.
+    /// doesn't include are stored without amounts or details, and adding the
+    /// module later doesn't fill those in yet.
     pub fn with_module(mut self, module: impl ObserverModule) -> Self {
         self.modules.push(Arc::new(module));
         self

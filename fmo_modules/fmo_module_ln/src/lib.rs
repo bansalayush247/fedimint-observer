@@ -9,7 +9,7 @@ use fedimint_ln_common::{
     LightningCommonInit, LightningConsensusItem, LightningInput, LightningOutput, LightningOutputV0,
 };
 use fmo_core::module::{
-    details_json, DbError, InputSummary, ItemMeta, ObserverModule, OutputSummary, ProcessCtx,
+    details_json, InputSummary, ItemMeta, ObserverModule, OutputSummary, ProcessCtx,
 };
 
 pub struct LnObserver;
@@ -85,7 +85,7 @@ impl ObserverModule for LnObserver {
         meta: &ItemMeta,
         output: &DynOutput,
         _summary: &OutputSummary,
-    ) -> Result<(), DbError> {
+    ) -> anyhow::Result<()> {
         let LightningOutputV0::Contract(contract) = v0_output(output) else {
             return Ok(());
         };

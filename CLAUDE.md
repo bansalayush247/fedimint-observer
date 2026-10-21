@@ -78,7 +78,7 @@ just test_package fmo_core
 ### Key Patterns
 1. **Shared Types**: All API types are defined in `fmo_api_types` and used by both frontend and backend
 2. **Database Migrations**: Version-controlled SQL migrations in `fmo_core/schema/` (v0-v11)
-3. **Modules**: Core writes the module-agnostic rows of every session item from the summary the owning module returns, then lets the module write its own tables in the same transaction. Kinds without a module in the build are stored without amounts or details. Module-specific API endpoints and background tasks (UTXOs, nonces, gateways) still live in `fmo_core`.
+3. **Modules**: Core writes the module-agnostic rows of every session item from the summary the owning module returns, then lets the module write its own tables in the same transaction. Kinds without a module in the build are stored without amounts or details, and adding the module later does not fill them in yet (core rows are written once). The default build must keep mint, wallet and ln: the v8 and v11 backfills need them. Module-specific API endpoints and background tasks (UTXOs, nonces, gateways) still live in `fmo_core`.
 4. **Background Monitoring**: `FederationObserver` spawns tasks to monitor multiple federations concurrently
 5. **State Management**: Backend uses shared app state with Arc/RwLock for thread safety
 6. **Error Handling**: Custom `AppError` type wrapping `anyhow::Error` for consistent error propagation

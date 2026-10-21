@@ -279,6 +279,25 @@ impl FederationObserver {
             "Database schema is newer than this binary; use a compatible observer version"
         );
 
+        // Backfills reprocess stored sessions with the registered modules and
+        // mark the migration done, so a build missing one would leave its
+        // data incomplete for good
+        const BACKFILL_MODULES: [&str; 3] = ["ln", "mint", "wallet"];
+        let needs_backfill = migrations.iter().enumerate().any(|(index, migration)| {
+            migration.backfill.is_some()
+                && maybe_schema_version.is_some_and(|schema_version| index > schema_version)
+        });
+        if needs_backfill {
+            let missing = BACKFILL_MODULES
+                .into_iter()
+                .filter(|kind| self.modules.get(kind).is_none())
+                .collect::<Vec<_>>();
+            ensure!(
+                missing.is_empty(),
+                "Pending migrations reprocess stored data and need the {missing:?} modules, which this build doesn't include"
+            );
+        }
+
         for (index, migration) in migrations.iter().enumerate() {
             if maybe_schema_version.is_none_or(|schema_version| index > schema_version) {
                 let mut conn = self.connection().await?;
@@ -835,7 +854,7 @@ impl FederationObserver {
         session_index: u64,
         item_index: u64,
         transaction: fedimint_core::transaction::Transaction,
-    ) -> Result<(), tokio_postgres::Error> {
+    ) -> anyhow::Result<()> {
         let fedimint_txid = transaction.tx_hash();
         let ctx = ProcessCtx {
             dbtx,
@@ -877,6 +896,7 @@ impl FederationObserver {
 
             let meta = ItemMeta {
                 federation_id,
+                module_instance_id: input.module_instance_id(),
                 txid: fedimint_txid,
                 session_index,
                 item_index,
@@ -925,6 +945,7 @@ impl FederationObserver {
 
             let meta = ItemMeta {
                 federation_id,
+                module_instance_id: output.module_instance_id(),
                 txid: fedimint_txid,
                 session_index,
                 item_index,
@@ -967,7 +988,7 @@ impl FederationObserver {
         item_index: u64,
         peer_id: PeerId,
         ci: DynModuleConsensusItem,
-    ) -> Result<(), tokio_postgres::Error> {
+    ) -> anyhow::Result<()> {
         let kind = instance_to_kind(config, ci.module_instance_id());
         let Some(module) = self.modules.get(&kind) else {
             warn!("Consensus Item of kind {kind}. Not implemented.");
@@ -996,6 +1017,7 @@ impl FederationObserver {
         };
         let meta = CiMeta {
             federation_id,
+            module_instance_id: ci.module_instance_id(),
             session_index,
             item_index,
             peer: peer_id,
