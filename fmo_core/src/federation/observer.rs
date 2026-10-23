@@ -42,7 +42,7 @@ use crate::db::DbMigration;
 use crate::federation::db::Federation;
 use crate::federation::gateways::GatewayOverviewCache;
 use crate::federation::{db, instance_to_kind};
-use crate::module::{CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx};
+use crate::module::{CiMeta, ItemMeta, ModuleRegistry, ProcessCtx};
 use crate::util::{execute, query, query_one, query_opt, query_value};
 use crate::{migration, migration_backfill, schema_setup};
 
@@ -814,7 +814,6 @@ impl FederationObserver {
                         item_idx as u64,
                         item.peer,
                         module_ci,
-                        &self.mempool_url,
                     )
                     .await?;
                 }
@@ -858,13 +857,10 @@ impl FederationObserver {
 
         for (in_idx, input) in transaction.inputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, input.module_instance_id());
-            // Kinds without a module crate in the build yet are still handled
-            // inline here
             let module = self.modules.get(&kind);
-            let summary = match module {
-                Some(module) => module.summarize_input(&input),
-                None => InputSummary::default(),
-            };
+            let summary = module
+                .map(|module| module.summarize_input(&input))
+                .unwrap_or_default();
 
             dbtx.execute(
                 "INSERT INTO transaction_inputs VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
@@ -879,26 +875,19 @@ impl FederationObserver {
             )
             .await?;
 
-            if let Some(module) = module {
-                let meta = ItemMeta {
-                    federation_id,
-                    txid: fedimint_txid,
-                    session_index,
-                    item_index,
-                    index: in_idx as u64,
-                };
-                module.process_input(&ctx, &meta, &input, &summary).await?;
+            let meta = ItemMeta {
+                federation_id,
+                txid: fedimint_txid,
+                session_index,
+                item_index,
+                index: in_idx as u64,
+            };
+            match module {
+                Some(module) => module.process_input(&ctx, &meta, &input, &summary).await?,
+                None => warn!("Transaction Input of kind {kind}. Not implemented."),
             }
 
-            let json_txi: Option<serde_json::Value> = match kind.as_str() {
-                _ if module.is_some() => summary.details.clone(),
-                other => {
-                    warn!("Transaction Input of kind {other}. Not implemented.");
-                    None
-                }
-            };
-
-            if let Some(json_value) = json_txi {
+            if let Some(json_value) = &summary.details {
                 dbtx.execute(
                     "INSERT INTO transaction_input_details VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
                     &[
@@ -906,7 +895,7 @@ impl FederationObserver {
                         &fedimint_txid.consensus_encode_to_vec(),
                         &(in_idx as i32),
                         &kind,
-                        &json_value,
+                        json_value,
                     ],
                 )
                 .await?;
@@ -916,10 +905,9 @@ impl FederationObserver {
         for (out_idx, output) in transaction.outputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, output.module_instance_id());
             let module = self.modules.get(&kind);
-            let summary = match module {
-                Some(module) => module.summarize_output(&output),
-                None => OutputSummary::default(),
-            };
+            let summary = module
+                .map(|module| module.summarize_output(&output))
+                .unwrap_or_default();
 
             dbtx.execute(
                 "INSERT INTO transaction_outputs VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
@@ -935,29 +923,23 @@ impl FederationObserver {
             )
             .await?;
 
-            if let Some(module) = module {
-                let meta = ItemMeta {
-                    federation_id,
-                    txid: fedimint_txid,
-                    session_index,
-                    item_index,
-                    index: out_idx as u64,
-                };
-                module
-                    .process_output(&ctx, &meta, &output, &summary)
-                    .await?;
+            let meta = ItemMeta {
+                federation_id,
+                txid: fedimint_txid,
+                session_index,
+                item_index,
+                index: out_idx as u64,
+            };
+            match module {
+                Some(module) => {
+                    module
+                        .process_output(&ctx, &meta, &output, &summary)
+                        .await?
+                }
+                None => warn!("Transaction Output of kind {kind}. Not implemented."),
             }
 
-            let json_txo: Option<serde_json::Value> = match kind.as_str() {
-                _ if module.is_some() => summary.details.clone(),
-
-                other => {
-                    warn!("Transaction Output of kind {other}. Not implemented.");
-                    None
-                }
-            };
-
-            if let Some(json_value) = json_txo {
+            if let Some(json_value) = &summary.details {
                 dbtx.execute(
                     "INSERT INTO transaction_output_details VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
                     &[
@@ -965,7 +947,7 @@ impl FederationObserver {
                         &fedimint_txid.consensus_encode_to_vec(),
                         &(out_idx as i32),
                         &kind,
-                        &json_value,
+                        json_value,
                     ],
                 )
                 .await?;
@@ -985,20 +967,14 @@ impl FederationObserver {
         item_index: u64,
         peer_id: PeerId,
         ci: DynModuleConsensusItem,
-        mempool_url: &str,
     ) -> Result<(), tokio_postgres::Error> {
         let kind = instance_to_kind(config, ci.module_instance_id());
-        let module = self.modules.get(&kind);
-
-        let json_ci: Option<serde_json::Value> = match kind.as_str() {
-            _ if module.is_some() => module.and_then(|module| module.summarize_ci(&ci)),
-            other => {
-                warn!("Consensus Item of kind {other}. Not implemented.");
-                None
-            }
+        let Some(module) = self.modules.get(&kind) else {
+            warn!("Consensus Item of kind {kind}. Not implemented.");
+            return Ok(());
         };
 
-        if let Some(json_value) = json_ci {
+        if let Some(json_value) = module.summarize_ci(&ci) {
             dbtx.execute(
                 "INSERT INTO consensus_items VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
                 &[
@@ -1013,22 +989,18 @@ impl FederationObserver {
             .await?;
         }
 
-        if let Some(module) = module {
-            let ctx = ProcessCtx {
-                dbtx,
-                config,
-                mempool_url,
-            };
-            let meta = CiMeta {
-                federation_id,
-                session_index,
-                item_index,
-                peer: peer_id,
-            };
-            return module.process_ci(&ctx, &meta, &ci).await;
-        }
-
-        Ok(())
+        let ctx = ProcessCtx {
+            dbtx,
+            config,
+            mempool_url: &self.mempool_url,
+        };
+        let meta = CiMeta {
+            federation_id,
+            session_index,
+            item_index,
+            peer: peer_id,
+        };
+        module.process_ci(&ctx, &meta, &ci).await
     }
 
     async fn refresh_views(self) {

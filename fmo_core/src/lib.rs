@@ -83,9 +83,8 @@ pub struct FedimintObserverBuilder {
 }
 
 impl FedimintObserverBuilder {
-    /// Decode and process this module's items. Until they move into their own
-    /// crates, core still handles the mint, wallet and ln kinds itself when a
-    /// build doesn't include their module.
+    /// Decode and process this module's items. Items of modules a build
+    /// doesn't include are stored without amounts or details.
     pub fn with_module(mut self, module: impl ObserverModule) -> Self {
         self.modules.push(Arc::new(module));
         self

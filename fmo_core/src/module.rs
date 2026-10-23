@@ -166,11 +166,7 @@ impl ModuleRegistry {
         modules: impl IntoIterator<Item = (ModuleInstanceId, ModuleKind)>,
     ) -> ModuleDecoderRegistry {
         ModuleDecoderRegistry::new(modules.into_iter().filter_map(|(instance_id, kind)| {
-            let decoder = match self.get(kind.as_str()) {
-                Some(module) => module.decoder(),
-                // Kinds without a module crate yet are still decoded by core
-                None => crate::util::builtin_decoder(&kind)?,
-            };
+            let decoder = self.get(kind.as_str())?.decoder();
             Some((instance_id, kind, decoder))
         }))
         .with_fallback()

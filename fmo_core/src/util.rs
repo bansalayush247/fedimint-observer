@@ -1,6 +1,5 @@
 use deadpool_postgres::GenericClient;
 use fedimint_core::config::{ClientConfig, ClientModuleConfig, JsonClientConfig, JsonWithKind};
-use fedimint_core::core::{Decoder, ModuleKind};
 use fedimint_core::encoding::DynRawFallback;
 use hex::ToHex;
 use postgres_from_row::FromRow;
@@ -47,13 +46,6 @@ pub fn config_to_json(
             )
             .collect(),
     })
-}
-
-/// Decoder of a module kind core still handles itself, until the kind moves
-/// into its own module crate
-pub fn builtin_decoder(module_kind: &ModuleKind) -> Option<Decoder> {
-    let _ = module_kind;
-    None
 }
 
 pub async fn execute(
