@@ -3,7 +3,6 @@ use fedimint_core::config::{ClientConfig, ClientModuleConfig, JsonClientConfig, 
 use fedimint_core::core::{Decoder, ModuleKind};
 use fedimint_core::encoding::DynRawFallback;
 use fedimint_core::module::CommonModuleInit;
-use fedimint_ln_common::LightningCommonInit;
 use fedimint_wallet_common::WalletCommonInit;
 use hex::ToHex;
 use postgres_from_row::FromRow;
@@ -58,7 +57,6 @@ pub fn config_to_json(
 /// into its own module crate
 pub fn builtin_decoder(module_kind: &ModuleKind) -> Option<Decoder> {
     let decoder = match module_kind.as_str() {
-        "ln" => LightningCommonInit::decoder(),
         "wallet" => WalletCommonInit::decoder(),
         #[cfg(feature = "stability_pool_v1")]
         "stability_pool" => StabilityPoolCommonGen::decoder(),

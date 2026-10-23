@@ -22,10 +22,6 @@ use fedimint_core::task::TaskGroup;
 use fedimint_core::util::backoff_util::background_backoff;
 use fedimint_core::util::retry;
 use fedimint_core::{Amount, PeerId};
-use fedimint_ln_common::contracts::{Contract, IdentifiableContract};
-use fedimint_ln_common::{
-    LightningConsensusItem, LightningInput, LightningOutput, LightningOutputV0,
-};
 use fedimint_wallet_common::endpoint_constants::WALLET_SUMMARY_ENDPOINT;
 use fedimint_wallet_common::{
     TxOutputSummary, WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0, WalletSummary,
@@ -869,18 +865,8 @@ impl FederationObserver {
             // Kinds without a module crate in the build yet are still handled
             // inline here
             let module = self.modules.get(&kind);
-            let (maybe_amount_msat, maybe_ln_contract_id) = match kind.as_str() {
-                _ if module.is_some() => (None, None),
-                "ln" => {
-                    let input = input
-                        .as_any()
-                        .downcast_ref::<LightningInput>()
-                        .expect("Not LN input")
-                        .maybe_v0_ref()
-                        .expect("Not v0");
-
-                    (Some(input.amount.msats), Some(input.contract_id))
-                }
+            let maybe_amount_msat = match kind.as_str() {
+                _ if module.is_some() => None,
                 "wallet" => {
                     let amount = match input
                         .as_any()
@@ -896,15 +882,15 @@ impl FederationObserver {
 
                     let amount_msat = amount.to_sat() * 1000;
 
-                    (Some(amount_msat), None)
+                    Some(amount_msat)
                 }
-                _ => (None, None),
+                _ => None,
             };
             let summary = match module {
                 Some(module) => module.summarize_input(&input),
                 None => InputSummary {
                     amount_msat: maybe_amount_msat,
-                    ln_contract_id: maybe_ln_contract_id.map(|cid| cid.consensus_encode_to_vec()),
+                    ln_contract_id: None,
                     details: None,
                 },
             };
@@ -981,18 +967,6 @@ impl FederationObserver {
                         None
                     }
                 },
-                "ln" => match input.as_any().downcast_ref::<LightningInput>() {
-                    Some(input) => {
-                        let value = serde_json::to_value(input)
-                            .expect("Should be able to serialize to JSON");
-                        debug!("found Lightning Transaction Input: {value:?}");
-                        Some(value)
-                    }
-                    None => {
-                        warn!("could not downcast (check decoders registry). {input:?}");
-                        None
-                    }
-                },
                 #[cfg(feature = "stability_pool_v1")]
                 "stability_pool" => match input.as_any().downcast_ref::<StabilityPoolInput>() {
                     Some(input) => {
@@ -1030,51 +1004,8 @@ impl FederationObserver {
         for (out_idx, output) in transaction.outputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, output.module_instance_id());
             let module = self.modules.get(&kind);
-            let (maybe_amount_msat, maybe_ln_contract) = match kind.as_str() {
-                _ if module.is_some() => (None, None),
-                "ln" => {
-                    let ln_output = output
-                        .as_any()
-                        .downcast_ref::<LightningOutput>()
-                        .expect("Not LN input")
-                        .maybe_v0_ref()
-                        .expect("Not v0");
-                    let (maybe_amount_msat, ln_contract_interaction_kind, contract_id) =
-                        match ln_output {
-                            LightningOutputV0::Contract(contract) => {
-                                let contract_id = contract.contract.contract_id();
-                                let (contract_type, payment_hash) = match &contract.contract {
-                                    Contract::Incoming(c) => ("incoming", c.hash),
-                                    Contract::Outgoing(c) => ("outgoing", c.hash),
-                                };
-
-                                dbtx.execute(
-                                    "INSERT INTO ln_contracts VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-                                    &[
-                                        &federation_id.consensus_encode_to_vec(),
-                                        &contract_id.consensus_encode_to_vec(),
-                                        &contract_type,
-                                        &payment_hash.consensus_encode_to_vec(),
-                                    ],
-                                )
-                                .await?;
-
-                                (Some(contract.amount.msats), "fund", contract_id)
-                            }
-                            LightningOutputV0::Offer(offer) => {
-                                // For incoming contracts payment has == cotnract id
-                                (Some(0), "offer", offer.hash.into())
-                            }
-                            LightningOutputV0::CancelOutgoing { contract, .. } => {
-                                (Some(0), "cancel", *contract)
-                            }
-                        };
-
-                    (
-                        maybe_amount_msat,
-                        Some((ln_contract_interaction_kind, contract_id)),
-                    )
-                }
+            let maybe_amount_msat = match kind.as_str() {
+                _ if module.is_some() => None,
                 "wallet" => {
                     let amount_msat = output
                         .as_any()
@@ -1085,16 +1016,15 @@ impl FederationObserver {
                         .amount()
                         .to_sat()
                         * 1000;
-                    (Some(amount_msat), None)
+                    Some(amount_msat)
                 }
-                _ => (None, None),
+                _ => None,
             };
             let summary = match module {
                 Some(module) => module.summarize_output(&output),
                 None => OutputSummary {
                     amount_msat: maybe_amount_msat,
-                    ln_contract: maybe_ln_contract
-                        .map(|(kind, id)| (kind, id.consensus_encode_to_vec())),
+                    ln_contract: None,
                     details: None,
                 },
             };
@@ -1173,18 +1103,6 @@ impl FederationObserver {
                         None
                     }
                 },
-                "ln" => match output.as_any().downcast_ref::<LightningOutput>() {
-                    Some(output) => {
-                        let value = serde_json::to_value(output)
-                            .expect("Should be able to serialize to JSON");
-                        debug!("found Lightning Transaction Output: {value:?}");
-                        Some(value)
-                    }
-                    None => {
-                        warn!("could not downcast (check decoders registry). {output:?}");
-                        None
-                    }
-                },
                 #[cfg(feature = "stability_pool_v1")]
                 "stability_pool" => match output.as_any().downcast_ref::<StabilityPoolOutput>() {
                     Some(output) => {
@@ -1245,18 +1163,6 @@ impl FederationObserver {
                     let value =
                         serde_json::to_value(ci).expect("Should be able to serialize to JSON");
                     debug!("found Wallet CI: {value:?}");
-                    Some(value)
-                }
-                None => {
-                    warn!("could not downcast (check decoders registry). {ci:?}");
-                    None
-                }
-            },
-            "ln" => match ci.as_any().downcast_ref::<LightningConsensusItem>() {
-                Some(ci) => {
-                    let value =
-                        serde_json::to_value(ci).expect("Should be able to serialize to JSON");
-                    debug!("found Lightning CI: {value:?}");
                     Some(value)
                 }
                 None => {

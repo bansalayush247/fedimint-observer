@@ -7,6 +7,7 @@ description = "The default Fedimint Observer build"
 [dependencies]
 anyhow = "1.0.81"
 fmo_core = { path = "../fmo_core" }
+fmo_module_ln = { path = "../fmo_modules/fmo_module_ln" }
 fmo_module_mint = { path = "../fmo_modules/fmo_module_mint" }
 tokio = { version = "1.37.0", features = ["full"] }
 
