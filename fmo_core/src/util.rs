@@ -1,8 +1,7 @@
 use deadpool_postgres::GenericClient;
 use fedimint_core::config::{ClientConfig, ClientModuleConfig, JsonClientConfig, JsonWithKind};
-use fedimint_core::core::{ModuleInstanceId, ModuleKind};
+use fedimint_core::core::{Decoder, ModuleKind};
 use fedimint_core::encoding::DynRawFallback;
-use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::module::CommonModuleInit;
 use fedimint_ln_common::LightningCommonInit;
 use fedimint_mint_common::MintCommonInit;
@@ -14,15 +13,13 @@ use serde_json::json;
 use stability_pool_common::StabilityPoolCommonGen;
 
 use crate::config::meta::MetaFields;
+use crate::module::ModuleRegistry;
 
-pub fn config_to_json(cfg: ClientConfig) -> anyhow::Result<JsonClientConfig> {
-    let decoders = get_decoders(
-        cfg.modules
-            .iter()
-            .map(|(module_instance_id, module_config)| {
-                (*module_instance_id, module_config.kind.clone())
-            }),
-    );
+pub fn config_to_json(
+    cfg: ClientConfig,
+    modules: &ModuleRegistry,
+) -> anyhow::Result<JsonClientConfig> {
+    let decoders = modules.decoders_for_config(&cfg);
     let config = cfg.redecode_raw(&decoders)?;
 
     Ok(JsonClientConfig {
@@ -58,26 +55,21 @@ pub fn config_to_json(cfg: ClientConfig) -> anyhow::Result<JsonClientConfig> {
     })
 }
 
-pub fn get_decoders(
-    modules: impl IntoIterator<Item = (ModuleInstanceId, ModuleKind)>,
-) -> ModuleDecoderRegistry {
-    ModuleDecoderRegistry::new(modules.into_iter().filter_map(
-        |(module_instance_id, module_kind)| {
-            let decoder = match module_kind.as_str() {
-                "ln" => LightningCommonInit::decoder(),
-                "wallet" => WalletCommonInit::decoder(),
-                "mint" => MintCommonInit::decoder(),
-                #[cfg(feature = "stability_pool_v1")]
-                "stability_pool" => StabilityPoolCommonGen::decoder(),
-                _ => {
-                    return None;
-                }
-            };
+/// Decoder of a module kind core still handles itself, until the kind moves
+/// into its own module crate
+pub fn builtin_decoder(module_kind: &ModuleKind) -> Option<Decoder> {
+    let decoder = match module_kind.as_str() {
+        "ln" => LightningCommonInit::decoder(),
+        "wallet" => WalletCommonInit::decoder(),
+        "mint" => MintCommonInit::decoder(),
+        #[cfg(feature = "stability_pool_v1")]
+        "stability_pool" => StabilityPoolCommonGen::decoder(),
+        _ => {
+            return None;
+        }
+    };
 
-            Some((module_instance_id, module_kind, decoder))
-        },
-    ))
-    .with_fallback()
+    Some(decoder)
 }
 
 pub async fn execute(

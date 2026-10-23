@@ -70,6 +70,7 @@ just test_package fmo_core
   - `/config/*` endpoints - Federation configuration API (stable)
   - `/federations/*` endpoints - Federation monitoring API (unstable)
   - Background tasks for monitoring federations and syncing data
+  - `module.rs` - the `ObserverModule` trait and `ModuleRegistry`. Module kinds without a module crate in the build yet are still handled inline in `federation/observer.rs`
 - `fmo_frontend_react/` - Frontend (React + TypeScript)
 
 ### Key Patterns

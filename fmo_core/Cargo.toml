@@ -16,6 +16,7 @@ fedimint-mint-common = { workspace = true }
 fedimint-wallet-common = { workspace = true }
 
 anyhow = "1.0.81"
+async-trait = "0.1.92"
 async-stream = "0.3.5"
 axum = { version = "0.7.5", features = ["json"] }
 axum-auth = "0.7.0"

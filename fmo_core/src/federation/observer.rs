@@ -50,7 +50,8 @@ use crate::config::meta::{ConsensusMetaCache, MetaFieldsExt};
 use crate::db::DbMigration;
 use crate::federation::db::Federation;
 use crate::federation::gateways::GatewayOverviewCache;
-use crate::federation::{db, decoders_from_config, instance_to_kind};
+use crate::federation::{db, instance_to_kind};
+use crate::module::{CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx};
 use crate::util::{execute, query, query_one, query_opt, query_value};
 use crate::{migration, migration_backfill, schema_setup};
 
@@ -92,6 +93,7 @@ pub struct FederationObserver {
     guardian_claims_cache: Arc<Mutex<HashMap<FederationId, GuardianClaimsSlot>>>,
     onchain_cache: Arc<Mutex<HashMap<OutPoint, (Instant, OnChainOutput)>>>,
     gateway_overviews: GatewayOverviewCache,
+    modules: ModuleRegistry,
 }
 
 impl FederationObserver {
@@ -99,6 +101,7 @@ impl FederationObserver {
         database: &str,
         admin_auth: &str,
         mempool_url: &str,
+        modules: ModuleRegistry,
     ) -> anyhow::Result<FederationObserver> {
         let connection_pool = {
             let pool_config = deadpool_postgres::Config {
@@ -120,6 +123,7 @@ impl FederationObserver {
             guardian_claims_cache: Default::default(),
             onchain_cache: Default::default(),
             gateway_overviews: Default::default(),
+            modules,
         };
 
         slf.setup_schema().await?;
@@ -144,6 +148,10 @@ impl FederationObserver {
 
     pub fn connectors(&self) -> &ConnectorRegistry {
         &self.connectors
+    }
+
+    pub fn modules(&self) -> &ModuleRegistry {
+        &self.modules
     }
 
     pub(crate) fn gateway_overviews(&self) -> &GatewayOverviewCache {
@@ -330,7 +338,7 @@ impl FederationObserver {
                 "Parsing all session outcomes for fed: {}",
                 fed.federation_id
             );
-            let decoders = decoders_from_config(&fed.config);
+            let decoders = self.modules.decoders_for_config(&fed.config);
             let session_outcome_rows = dbtx
                 .query(
                     "SELECT * FROM sessions WHERE federation_id = $1",
@@ -387,7 +395,7 @@ impl FederationObserver {
         // wallet_withdrawal_addresses locks the federations table it references
         // until commit, so another connection would wait on us forever
         for fed in query::<Federation>(dbtx, "SELECT * FROM federations", &[]).await? {
-            let decoders = decoders_from_config(&fed.config);
+            let decoders = self.modules.decoders_for_config(&fed.config);
             let rows = dbtx
                 .query(
                     "SELECT p.on_chain_txid, p.on_chain_vout, p.in_index, t.data
@@ -718,7 +726,7 @@ impl FederationObserver {
             .map(|(&peer_id, peer_url)| (peer_id, peer_url.url.clone()))
             .collect();
         let api = DynGlobalApi::new(self.connectors.clone(), peers, None)?;
-        let decoders = decoders_from_config(&config);
+        let decoders = self.modules.decoders_for_config(&config);
 
         info!("Starting background job for {federation_id}");
         let next_session = self.federation_session_count(federation_id).await?;
@@ -796,7 +804,7 @@ impl FederationObserver {
         for (item_idx, item) in signed_session_outcome.items.into_iter().enumerate() {
             match item.item {
                 ConsensusItem::Transaction(transaction) => {
-                    Self::process_transaction(
+                    self.process_transaction(
                         dbtx,
                         federation_id,
                         &config,
@@ -807,7 +815,7 @@ impl FederationObserver {
                     .await?;
                 }
                 ConsensusItem::Module(module_ci) => {
-                    Self::process_ci(
+                    self.process_ci(
                         dbtx,
                         federation_id,
                         &config,
@@ -830,6 +838,7 @@ impl FederationObserver {
     }
 
     async fn process_transaction(
+        &self,
         dbtx: &Transaction<'_>,
         federation_id: FederationId,
         config: &ClientConfig,
@@ -838,6 +847,11 @@ impl FederationObserver {
         transaction: fedimint_core::transaction::Transaction,
     ) -> Result<(), tokio_postgres::Error> {
         let fedimint_txid = transaction.tx_hash();
+        let ctx = ProcessCtx {
+            dbtx,
+            config,
+            mempool_url: &self.mempool_url,
+        };
 
         dbtx.execute(
             "INSERT INTO transactions VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
@@ -853,7 +867,11 @@ impl FederationObserver {
 
         for (in_idx, input) in transaction.inputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, input.module_instance_id());
+            // Kinds without a module crate in the build yet are still handled
+            // inline here
+            let module = self.modules.get(&kind);
             let (maybe_amount_msat, maybe_ln_contract_id) = match kind.as_str() {
+                _ if module.is_some() => (None, None),
                 "ln" => {
                     let input = input
                         .as_any()
@@ -895,6 +913,14 @@ impl FederationObserver {
                 }
                 _ => (None, None),
             };
+            let summary = match module {
+                Some(module) => module.summarize_input(&input),
+                None => InputSummary {
+                    amount_msat: maybe_amount_msat,
+                    ln_contract_id: maybe_ln_contract_id.map(|cid| cid.consensus_encode_to_vec()),
+                    details: None,
+                },
+            };
 
             dbtx.execute(
                 "INSERT INTO transaction_inputs VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
@@ -903,13 +929,24 @@ impl FederationObserver {
                     &fedimint_txid.consensus_encode_to_vec(),
                     &(in_idx as i32),
                     &kind,
-                    &maybe_ln_contract_id.map(|cid| cid.consensus_encode_to_vec()),
-                    &maybe_amount_msat.map(|amt| amt as i64),
+                    &summary.ln_contract_id,
+                    &summary.amount_msat.map(|amt| amt as i64),
                 ],
             )
             .await?;
 
-            if kind.as_str() == "wallet" {
+            if let Some(module) = module {
+                let meta = ItemMeta {
+                    federation_id,
+                    txid: fedimint_txid,
+                    session_index,
+                    item_index,
+                    index: in_idx as u64,
+                };
+                module.process_input(&ctx, &meta, &input, &summary).await?;
+            }
+
+            if module.is_none() && kind.as_str() == "wallet" {
                 let (outpoint, script) = match input
                     .as_any()
                     .downcast_ref::<WalletInput>()
@@ -944,6 +981,7 @@ impl FederationObserver {
             }
 
             let json_txi: Option<serde_json::Value> = match kind.as_str() {
+                _ if module.is_some() => summary.details.clone(),
                 "mint" => match input.as_any().downcast_ref::<MintInput>() {
                     Some(input) => {
                         let value = serde_json::to_value(input)
@@ -1016,7 +1054,9 @@ impl FederationObserver {
 
         for (out_idx, output) in transaction.outputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, output.module_instance_id());
+            let module = self.modules.get(&kind);
             let (maybe_amount_msat, maybe_ln_contract) = match kind.as_str() {
+                _ if module.is_some() => (None, None),
                 "ln" => {
                     let ln_output = output
                         .as_any()
@@ -1085,6 +1125,15 @@ impl FederationObserver {
                 }
                 _ => (None, None),
             };
+            let summary = match module {
+                Some(module) => module.summarize_output(&output),
+                None => OutputSummary {
+                    amount_msat: maybe_amount_msat,
+                    ln_contract: maybe_ln_contract
+                        .map(|(kind, id)| (kind, id.consensus_encode_to_vec())),
+                    details: None,
+                },
+            };
 
             dbtx.execute(
                 "INSERT INTO transaction_outputs VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
@@ -1093,14 +1142,27 @@ impl FederationObserver {
                     &fedimint_txid.consensus_encode_to_vec(),
                     &(out_idx as i32),
                     &kind,
-                    &maybe_ln_contract.map(|(kind, _id)| kind),
-                    &maybe_ln_contract.map(|(_kind, id)| id.consensus_encode_to_vec()),
-                    &maybe_amount_msat.map(|amt| amt as i64),
+                    &summary.ln_contract.as_ref().map(|(kind, _id)| *kind),
+                    &summary.ln_contract.as_ref().map(|(_kind, id)| id),
+                    &summary.amount_msat.map(|amt| amt as i64),
                 ],
             )
             .await?;
 
-            if kind.as_str() == "wallet" {
+            if let Some(module) = module {
+                let meta = ItemMeta {
+                    federation_id,
+                    txid: fedimint_txid,
+                    session_index,
+                    item_index,
+                    index: out_idx as u64,
+                };
+                module
+                    .process_output(&ctx, &meta, &output, &summary)
+                    .await?;
+            }
+
+            if module.is_none() && kind.as_str() == "wallet" {
                 let wallet_v0_output = output
                     .as_any()
                     .downcast_ref::<WalletOutput>()
@@ -1134,6 +1196,7 @@ impl FederationObserver {
             }
 
             let json_txo: Option<serde_json::Value> = match kind.as_str() {
+                _ if module.is_some() => summary.details.clone(),
                 "mint" => match output.as_any().downcast_ref::<MintOutput>() {
                     Some(output) => {
                         let value = serde_json::to_value(output)
@@ -1210,6 +1273,7 @@ impl FederationObserver {
 
     #[allow(clippy::too_many_arguments)]
     async fn process_ci(
+        &self,
         dbtx: &Transaction<'_>,
         federation_id: FederationId,
         config: &ClientConfig,
@@ -1220,8 +1284,10 @@ impl FederationObserver {
         mempool_url: &str,
     ) -> Result<(), tokio_postgres::Error> {
         let kind = instance_to_kind(config, ci.module_instance_id());
+        let module = self.modules.get(&kind);
 
         let json_ci: Option<serde_json::Value> = match kind.as_str() {
+            _ if module.is_some() => module.and_then(|module| module.summarize_ci(&ci)),
             "mint" => match ci.as_any().downcast_ref::<MintConsensusItem>() {
                 Some(ci) => {
                     let value =
@@ -1290,6 +1356,21 @@ impl FederationObserver {
                 ],
             )
             .await?;
+        }
+
+        if let Some(module) = module {
+            let ctx = ProcessCtx {
+                dbtx,
+                config,
+                mempool_url,
+            };
+            let meta = CiMeta {
+                federation_id,
+                session_index,
+                item_index,
+                peer: peer_id,
+            };
+            return module.process_ci(&ctx, &meta, &ci).await;
         }
 
         if kind != "wallet" {
@@ -1856,7 +1937,7 @@ impl FederationObserver {
             .map(|non_zero_cpus| non_zero_cpus.get())
             .unwrap_or(12);
 
-        let decoders = decoders_from_config(&federation.config);
+        let decoders = self.modules.decoders_for_config(&federation.config);
 
         let mut connection = self.connection().await?;
         let dbtx = connection.transaction().await?;

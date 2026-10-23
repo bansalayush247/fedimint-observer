@@ -1,4 +1,6 @@
+use fmo_core::FedimintObserver;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    fmo_core::run().await
+    FedimintObserver::builder().run().await
 }

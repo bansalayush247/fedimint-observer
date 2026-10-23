@@ -1,4 +1,17 @@
-//! Module-agnostic core of Fedimint Observer
+//! Module-agnostic core of Fedimint Observer.
+//!
+//! An observer build picks its modules and runs:
+//!
+//! ```ignore
+//! FedimintObserver::builder()
+//!     .with_module(MintObserver)
+//!     .with_module(WalletObserver)
+//!     .with_module(LnObserver)
+//!     .run()
+//!     .await
+//! ```
+
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::routing::{get, put};
@@ -15,6 +28,7 @@ use crate::config::{get_config_routes, FederationConfigCache};
 use crate::federation::get_federations_routes;
 use crate::federation::nostr::{get_nostr_federations, publish_federation_event};
 use crate::federation::observer::FederationObserver;
+use crate::module::{ModuleRegistry, ObserverModule};
 
 /// Fedimint config fetching service implementation
 mod config;
@@ -23,6 +37,7 @@ mod db;
 mod error;
 mod federation;
 mod meta;
+pub mod module;
 mod util;
 
 #[derive(Parser, Debug)]
@@ -53,9 +68,37 @@ struct AppState {
     federation_observer: FederationObserver,
 }
 
-/// Parses the command line and environment, then runs the observer and its API
-/// server until it fails
-pub async fn run() -> anyhow::Result<()> {
+/// Entry point of an observer build
+pub struct FedimintObserver;
+
+impl FedimintObserver {
+    pub fn builder() -> FedimintObserverBuilder {
+        FedimintObserverBuilder::default()
+    }
+}
+
+#[derive(Default)]
+pub struct FedimintObserverBuilder {
+    modules: Vec<Arc<dyn ObserverModule>>,
+}
+
+impl FedimintObserverBuilder {
+    /// Decode and process this module's items. Until they move into their own
+    /// crates, core still handles the mint, wallet and ln kinds itself when a
+    /// build doesn't include their module.
+    pub fn with_module(mut self, module: impl ObserverModule) -> Self {
+        self.modules.push(Arc::new(module));
+        self
+    }
+
+    /// Parses the command line and environment, then runs the observer and its
+    /// API server until it fails
+    pub async fn run(self) -> anyhow::Result<()> {
+        run(ModuleRegistry::new(self.modules)?).await
+    }
+}
+
+async fn run(modules: ModuleRegistry) -> anyhow::Result<()> {
     let args = Args::parse();
 
     tracing_subscriber::registry()
@@ -68,6 +111,10 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .init();
 
+    info!(
+        "Observing modules {:?}",
+        modules.kinds().collect::<Vec<_>>()
+    );
     info!("Starting API server on {}", args.bind);
 
     let app = Router::new()
@@ -86,6 +133,7 @@ pub async fn run() -> anyhow::Result<()> {
                 &args.database,
                 &args.admin_auth,
                 &args.mempool_url,
+                modules,
             )
             .await?,
         });
