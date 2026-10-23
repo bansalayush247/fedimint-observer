@@ -1,5 +1,4 @@
 -- raw Consensus Items and Transaction details tables
-BEGIN;
 
 INSERT INTO
     schema_version (version)
@@ -52,5 +51,3 @@ CREATE INDEX IF NOT EXISTS federation_output_details ON transaction_output_detai
 CREATE INDEX IF NOT EXISTS federation_transaction_output_details ON transaction_output_details (federation_id, txid);
 
 CREATE INDEX IF NOT EXISTS federation_kind_output_details ON transaction_output_details (federation_id, kind);
-
-COMMIT;

@@ -35,14 +35,15 @@ use postgres_from_row::FromRow;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 use tracing::log::info;
-use tracing::{debug, error, info_span, warn, Instrument};
+use tracing::{debug, info_span, warn, Instrument};
 
 use crate::config::meta::{ConsensusMetaCache, MetaFieldsExt};
 use crate::db::DbMigration;
 use crate::federation::db::Federation;
 use crate::federation::gateways::GatewayOverviewCache;
 use crate::federation::{db, instance_to_kind};
-use crate::module::{CiMeta, ItemMeta, ModuleRegistry, ProcessCtx};
+use crate::module::{CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx};
+use crate::task::supervise;
 use crate::util::{execute, query, query_one, query_opt, query_value};
 use crate::{migration, migration_backfill, schema_setup};
 
@@ -123,15 +124,49 @@ impl FederationObserver {
             slf.spawn_observer(federation).await;
         }
 
-        slf.task_group
-            .spawn_cancellable("fetch block times", Self::fetch_block_times(slf.clone()));
-        slf.task_group
-            .spawn_cancellable("sync nostr events", Self::sync_nostr_events(slf.clone()));
-        slf.task_group
-            .spawn_cancellable("refresh views", Self::refresh_views(slf.clone()));
+        let observer = slf.clone();
+        slf.task_group.spawn_cancellable(
+            "fetch block times",
+            supervise("Block time fetcher", move || {
+                let observer = observer.clone();
+                async move {
+                    observer.fetch_block_times().await;
+                    Ok(())
+                }
+            }),
+        );
+        let observer = slf.clone();
+        slf.task_group.spawn_cancellable(
+            "sync nostr events",
+            supervise("Nostr sync", move || {
+                let observer = observer.clone();
+                async move {
+                    observer.sync_nostr_events().await;
+                    Ok(())
+                }
+            }),
+        );
+        let observer = slf.clone();
+        slf.task_group.spawn_cancellable(
+            "refresh views",
+            supervise("View refresher", move || {
+                let observer = observer.clone();
+                async move {
+                    observer.refresh_views().await;
+                    Ok(())
+                }
+            }),
+        );
+        let observer = slf.clone();
         slf.task_group.spawn_cancellable(
             "refresh gateway overviews",
-            Self::refresh_gateway_overviews(slf.clone()),
+            supervise("Gateway overview refresher", move || {
+                let observer = observer.clone();
+                async move {
+                    observer.refresh_gateway_overviews().await;
+                    Ok(())
+                }
+            }),
         );
 
         Ok(slf)
@@ -156,16 +191,11 @@ impl FederationObserver {
         let config = federation.config.clone();
         self.task_group.spawn_cancellable(
             format!("Observer for {}", federation_id),
-            async move {
-                loop {
-                    let e = slf
-                        .observe_federation_history(federation_id, config.clone())
-                        .await
-                        .expect_err("observer task exited unexpectedly");
-                    error!("Observer errored, restarting in 30s: {e}");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
-            }
+            supervise("Observer", move || {
+                let slf = slf.clone();
+                let config = config.clone();
+                async move { slf.observe_federation_history(federation_id, config).await }
+            })
             .instrument(info_span!("sessions", fed = %federation_id.to_prefix())),
         );
 
@@ -174,16 +204,11 @@ impl FederationObserver {
         let config = federation.config.clone();
         self.task_group.spawn_cancellable(
             format!("Health Monitor for {}", federation_id),
-            async move {
-                loop {
-                    let e = slf
-                        .monitor_health(federation_id, config.clone())
-                        .await
-                        .expect_err("health monitor task exited unexpectedly");
-                    error!("Health Monitor errored, restarting in 30s: {e}");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
-            }
+            supervise("Health Monitor", move || {
+                let slf = slf.clone();
+                let config = config.clone();
+                async move { slf.monitor_health(federation_id, config).await }
+            })
             .instrument(info_span!("health", fed = %federation_id.to_prefix())),
         );
 
@@ -192,16 +217,11 @@ impl FederationObserver {
         let config = federation.config;
         self.task_group.spawn_cancellable(
             format!("Gateway Monitor for {}", federation_id),
-            async move {
-                loop {
-                    let e = slf
-                        .monitor_gateways(federation_id, config.clone())
-                        .await
-                        .expect_err("gateway monitor task exited unexpectedly");
-                    error!("Gateway Monitor errored, restarting in 30s: {e}");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
-            }
+            supervise("Gateway Monitor", move || {
+                let slf = slf.clone();
+                let config = config.clone();
+                async move { slf.monitor_gateways(federation_id, config).await }
+            })
             .instrument(info_span!("gateways", fed = %federation_id.to_prefix())),
         );
     }
@@ -877,9 +897,10 @@ impl FederationObserver {
         for (in_idx, input) in transaction.inputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, input.module_instance_id());
             let module = self.modules.get(&kind);
-            let summary = module
-                .map(|module| module.summarize_input(&input))
-                .unwrap_or_default();
+            let summary = match module {
+                Some(module) => module.summarize_input(&input)?,
+                None => InputSummary::default(),
+            };
 
             dbtx.execute(
                 "INSERT INTO transaction_inputs VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
@@ -925,9 +946,10 @@ impl FederationObserver {
         for (out_idx, output) in transaction.outputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, output.module_instance_id());
             let module = self.modules.get(&kind);
-            let summary = module
-                .map(|module| module.summarize_output(&output))
-                .unwrap_or_default();
+            let summary = match module {
+                Some(module) => module.summarize_output(&output)?,
+                None => OutputSummary::default(),
+            };
 
             dbtx.execute(
                 "INSERT INTO transaction_outputs VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
@@ -1415,85 +1437,77 @@ impl FederationObserver {
             .collect())
     }
 
+    /// Reprocesses stored sessions of a federation, filling in rows that are
+    /// missing. Commits every `BACKFILL_BATCH` sessions, so an interrupted run
+    /// keeps its progress.
     pub async fn backfill_federation(
         &self,
         federation_id: FederationId,
         session_start: Option<i32>,
         session_end: Option<i32>,
     ) -> anyhow::Result<()> {
-        info!("Backfilling federation {}", federation_id);
+        const BACKFILL_BATCH: i32 = 1000;
 
-        let maybe_federation = self.get_federation(federation_id).await?;
-        if maybe_federation.is_none() {
-            info!("Federation {} not found", federation_id);
-            return Ok(());
-        }
-
+        let federation = self
+            .get_federation(federation_id)
+            .await?
+            .with_context(|| format!("Federation {federation_id} is not observed"))?;
         let session_start = session_start.unwrap_or(0);
-        let session_end = session_end.unwrap_or(i32::MAX);
-
-        if session_end < session_start {
-            info!("Session_start should come before session_end. Aborting backfill");
+        let Some(last_session) = query_value::<Option<i32>>(
+            &self.connection().await?,
+            "SELECT MAX(session_index) FROM sessions WHERE federation_id = $1",
+            &[&federation_id.consensus_encode_to_vec()],
+        )
+        .await?
+        else {
+            info!("Federation {federation_id} has no stored sessions to backfill");
             return Ok(());
-        }
-
-        let federation = maybe_federation.unwrap();
-
-        let num_cpus = std::thread::available_parallelism()
-            .map(|non_zero_cpus| non_zero_cpus.get())
-            .unwrap_or(12);
-
-        let decoders = self.modules.decoders_for_config(&federation.config);
-
-        let mut connection = self.connection().await?;
-        let dbtx = connection.transaction().await?;
-
-        let session_outcome_rows = dbtx
-            .query(
-                "SELECT * FROM sessions WHERE federation_id = $1 AND session_index BETWEEN $2 AND $3 ORDER BY session_index",
-                &[&federation.federation_id.consensus_encode_to_vec(), &(session_start), &(session_end)],
-            )
-            .await
-            .context("querying sessions for federation backfill")?;
-
-        let rows_count = session_outcome_rows.len();
-        info!(
-            "Backfill will process {} sessions, from {} to {}",
-            rows_count, session_start, session_end
+        };
+        let session_end = session_end.unwrap_or(last_session).min(last_session);
+        ensure!(
+            session_start <= session_end,
+            "session_start {session_start} is after session_end {session_end}"
         );
 
-        let mut parsing_stream =
-            futures::stream::iter(session_outcome_rows.into_iter().enumerate())
-                .map(|(row_idx, row)| {
-                    let decoders_clone = decoders.clone();
-                    tokio::task::spawn(async move {
-                        if row_idx % 1000 == 0 {
-                            let percentage = (row_idx as f64) / (rows_count as f64);
-                            let percentage_str = format!("{:.2}%", percentage * 100.0);
-                            info!(
-                                "parsing session index: {:?}/{:?} ({})",
-                                row_idx, rows_count, percentage_str
-                            );
-                        }
-                        db::SessionOutcome::from_row_with_decoders(&row, &decoders_clone.clone())
-                    })
-                })
-                .buffered(num_cpus)
-                .boxed();
+        info!("Backfilling federation {federation_id}, sessions {session_start} to {session_end}");
+        let decoders = self.modules.decoders_for_config(&federation.config);
+        let mut batch_start = session_start;
+        let mut processed = 0;
+        loop {
+            let batch_end = batch_start
+                .saturating_add(BACKFILL_BATCH - 1)
+                .min(session_end);
+            let mut connection = self.connection().await?;
+            let dbtx = connection.transaction().await?;
+            let rows = dbtx
+                .query(
+                    "SELECT * FROM sessions WHERE federation_id = $1 AND session_index BETWEEN $2 AND $3 ORDER BY session_index",
+                    &[&federation_id.consensus_encode_to_vec(), &batch_start, &batch_end],
+                )
+                .await
+                .context("querying sessions for federation backfill")?;
+            for row in rows {
+                let outcome = db::SessionOutcome::try_from_row_with_decoders(&row, &decoders)?;
+                self.process_session(
+                    federation_id,
+                    federation.config.clone(),
+                    outcome.session_index as u64,
+                    outcome.data,
+                    &dbtx,
+                )
+                .await?;
+                processed += 1;
+            }
+            dbtx.commit().await?;
+            info!("Backfilled up to session {batch_end} ({processed} sessions)");
 
-        while let Some(outcome) = parsing_stream.next().await.transpose()? {
-            self.process_session(
-                federation.federation_id,
-                federation.config.clone(),
-                outcome.session_index as u64,
-                outcome.data,
-                &dbtx,
-            )
-            .await?;
+            if batch_end >= session_end {
+                break;
+            }
+            batch_start = batch_end + 1;
         }
 
         info!("Backfill complete!");
-
         Ok(())
     }
 }

@@ -1,5 +1,4 @@
 -- Incrementally maintained per-federation totals
-BEGIN;
 
 INSERT INTO schema_version (version)
 VALUES (9);
@@ -71,5 +70,3 @@ FROM federations f
 ON CONFLICT (federation_id) DO UPDATE
     SET tx_count = EXCLUDED.tx_count,
         tx_volume_msat = EXCLUDED.tx_volume_msat;
-
-COMMIT;

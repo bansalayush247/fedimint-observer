@@ -38,6 +38,7 @@ mod error;
 mod federation;
 mod meta;
 pub mod module;
+mod task;
 mod util;
 
 #[derive(Parser, Debug)]

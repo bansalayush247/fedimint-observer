@@ -1,5 +1,6 @@
 //! Observes the Lightning (v1) module: contracts funded, claimed and cancelled
 
+use anyhow::Context;
 use async_trait::async_trait;
 use fedimint_core::core::{Decoder, DynInput, DynModuleConsensusItem, DynOutput, ModuleKind};
 use fedimint_core::encoding::Encodable;
@@ -14,13 +15,13 @@ use fmo_core::module::{
 
 pub struct LnObserver;
 
-fn v0_output(output: &DynOutput) -> &LightningOutputV0 {
+fn v0_output(output: &DynOutput) -> anyhow::Result<&LightningOutputV0> {
     output
         .as_any()
         .downcast_ref::<LightningOutput>()
-        .expect("Not LN input")
+        .context("Not LN output")?
         .maybe_v0_ref()
-        .expect("Not v0")
+        .context("Unsupported LightningOutput version")
 }
 
 #[async_trait]
@@ -33,15 +34,15 @@ impl ObserverModule for LnObserver {
         LightningCommonInit::decoder()
     }
 
-    fn summarize_input(&self, input: &DynInput) -> InputSummary {
+    fn summarize_input(&self, input: &DynInput) -> anyhow::Result<InputSummary> {
         let v0 = input
             .as_any()
             .downcast_ref::<LightningInput>()
-            .expect("Not LN input")
+            .context("Not LN input")?
             .maybe_v0_ref()
-            .expect("Not v0");
+            .context("Unsupported LightningInput version")?;
 
-        InputSummary {
+        Ok(InputSummary {
             amount_msat: Some(v0.amount.msats),
             ln_contract_id: Some(v0.contract_id.consensus_encode_to_vec()),
             details: details_json::<LightningInput>(
@@ -49,11 +50,11 @@ impl ObserverModule for LnObserver {
                 input,
                 "Lightning Transaction Input",
             ),
-        }
+        })
     }
 
-    fn summarize_output(&self, output: &DynOutput) -> OutputSummary {
-        let (amount_msat, interaction, contract_id) = match v0_output(output) {
+    fn summarize_output(&self, output: &DynOutput) -> anyhow::Result<OutputSummary> {
+        let (amount_msat, interaction, contract_id) = match v0_output(output)? {
             LightningOutputV0::Contract(contract) => (
                 contract.amount.msats,
                 "fund",
@@ -64,7 +65,7 @@ impl ObserverModule for LnObserver {
             LightningOutputV0::CancelOutgoing { contract, .. } => (0, "cancel", *contract),
         };
 
-        OutputSummary {
+        Ok(OutputSummary {
             amount_msat: Some(amount_msat),
             ln_contract: Some((interaction, contract_id.consensus_encode_to_vec())),
             details: details_json::<LightningOutput>(
@@ -72,7 +73,7 @@ impl ObserverModule for LnObserver {
                 output,
                 "Lightning Transaction Output",
             ),
-        }
+        })
     }
 
     fn summarize_ci(&self, ci: &DynModuleConsensusItem) -> Option<serde_json::Value> {
@@ -86,7 +87,7 @@ impl ObserverModule for LnObserver {
         output: &DynOutput,
         _summary: &OutputSummary,
     ) -> anyhow::Result<()> {
-        let LightningOutputV0::Contract(contract) = v0_output(output) else {
+        let LightningOutputV0::Contract(contract) = v0_output(output)? else {
             return Ok(());
         };
         let (contract_type, payment_hash) = match &contract.contract {
@@ -106,5 +107,35 @@ impl ObserverModule for LnObserver {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::core::{DynInput, DynOutput};
+    use fedimint_ln_common::{LightningInput, LightningOutput};
+    use fmo_core::module::ObserverModule;
+
+    use super::LnObserver;
+
+    #[test]
+    fn unsupported_versions_are_errors() {
+        let input = DynInput::from_typed(
+            0,
+            LightningInput::Default {
+                variant: 99,
+                bytes: vec![],
+            },
+        );
+        assert!(LnObserver.summarize_input(&input).is_err());
+
+        let output = DynOutput::from_typed(
+            0,
+            LightningOutput::Default {
+                variant: 99,
+                bytes: vec![],
+            },
+        );
+        assert!(LnObserver.summarize_output(&output).is_err());
     }
 }

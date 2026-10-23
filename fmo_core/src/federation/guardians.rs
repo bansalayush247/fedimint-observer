@@ -79,8 +79,8 @@ impl FederationObserver {
                             })
                             .map(|block_count| {
                                 // Fedimint uses 1-based block heights, while bitcoind uses 0-based
-                                // heights
-                                block_count - 1
+                                // heights. A guardian without blocks reports 0.
+                                block_count.saturating_sub(1)
                             });
                         let api_latency = start_time.elapsed();
 

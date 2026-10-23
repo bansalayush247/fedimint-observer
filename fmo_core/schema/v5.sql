@@ -1,5 +1,4 @@
 -- Create the update session_times view
-BEGIN;
 INSERT INTO schema_version (version)
 VALUES (5);
 
@@ -80,5 +79,3 @@ CREATE UNIQUE INDEX session_times_federation_id_session_index_idx ON session_tim
 CREATE INDEX session_times_federation_id_estimated_session_timestamp_idx ON session_times (
     federation_id, estimated_session_timestamp
 );
-
-COMMIT;

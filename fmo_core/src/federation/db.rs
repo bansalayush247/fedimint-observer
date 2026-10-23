@@ -110,13 +110,13 @@ impl SessionOutcome {
     pub fn try_from_row_with_decoders(
         row: &Row,
         decoders: &ModuleDecoderRegistry,
-    ) -> Result<Self, Error> {
+    ) -> anyhow::Result<Self> {
         let session_data_bytes: Vec<u8> = row.try_get("session")?;
         let data = fedimint_core::session_outcome::SessionOutcome::consensus_decode_whole(
             &session_data_bytes,
             decoders,
         )
-        .expect("Invalid data in DB");
+        .map_err(|error| anyhow::anyhow!("Invalid session data in DB: {error}"))?;
 
         let session_index = row.try_get::<_, i32>("session_index")?;
 

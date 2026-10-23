@@ -1,4 +1,3 @@
-BEGIN;
 
 INSERT INTO
     schema_version (version)
@@ -34,5 +33,3 @@ CREATE INDEX IF NOT EXISTS gateway_poll_snapshots_fed_time
 
 ALTER TABLE guardian_health
     ADD COLUMN IF NOT EXISTS software_version TEXT;
-
-COMMIT;

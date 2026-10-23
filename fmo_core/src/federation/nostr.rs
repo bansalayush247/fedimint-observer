@@ -40,11 +40,10 @@ impl FederationObserver {
     pub async fn sync_nostr_events(self) {
         const SLEEP_SECS: u64 = 60;
         loop {
-            let e = self
-                .sync_nostr_events_inner()
-                .await
-                .expect_err("Not expected to exit");
-            warn!("Error while syncing nostr events: {e:?}");
+            match self.sync_nostr_events_inner().await {
+                Ok(()) => warn!("Nostr sync exited unexpectedly"),
+                Err(e) => warn!("Error while syncing nostr events: {e:?}"),
+            }
             sleep(Duration::from_secs(SLEEP_SECS)).await;
         }
     }
@@ -151,7 +150,7 @@ impl FederationObserver {
         }
 
         query::<RawNostrFederation>(
-            &self.connection().await.expect("db connection"),
+            &self.connection().await?,
             // language=postgresql
             "select federation_id, MIN(invite_code) as invite_code from nostr_federations group by federation_id",
             &[],

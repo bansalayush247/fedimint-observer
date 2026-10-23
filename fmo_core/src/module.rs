@@ -81,6 +81,8 @@ pub struct ProcessCtx<'a> {
 /// A Fedimint module the observer can decode and process.
 ///
 /// `summarize_*` must not do I/O: core calls them before writing its own row.
+/// Return errors rather than panicking: an error stalls only this federation,
+/// which retries the session 30 s later.
 /// `process_*` run afterwards in the same database transaction, so a module's
 /// tables may reference the core rows of the item.
 #[async_trait]
@@ -90,9 +92,9 @@ pub trait ObserverModule: Send + Sync + 'static {
 
     fn decoder(&self) -> Decoder;
 
-    fn summarize_input(&self, input: &DynInput) -> InputSummary;
+    fn summarize_input(&self, input: &DynInput) -> anyhow::Result<InputSummary>;
 
-    fn summarize_output(&self, output: &DynOutput) -> OutputSummary;
+    fn summarize_output(&self, output: &DynOutput) -> anyhow::Result<OutputSummary>;
 
     /// JSON stored in `consensus_items`, or `None` to store nothing
     fn summarize_ci(&self, ci: &DynModuleConsensusItem) -> Option<serde_json::Value>;

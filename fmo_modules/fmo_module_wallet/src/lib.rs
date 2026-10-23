@@ -3,12 +3,13 @@
 
 use std::str::FromStr;
 
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use bitcoin::hashes::Hash;
 use fedimint_core::core::{Decoder, DynInput, DynModuleConsensusItem, DynOutput, ModuleKind};
 use fedimint_core::encoding::Encodable;
 use fedimint_core::module::CommonModuleInit;
-use fedimint_core::util::backoff_util::background_backoff;
+use fedimint_core::util::backoff_util::aggressive_backoff;
 use fedimint_core::util::retry;
 use fedimint_wallet_common::{
     WalletCommonInit, WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0,
@@ -20,20 +21,20 @@ use tracing::warn;
 
 pub struct WalletObserver;
 
-fn wallet_input(input: &DynInput) -> &WalletInput {
+fn wallet_input(input: &DynInput) -> anyhow::Result<&WalletInput> {
     input
         .as_any()
         .downcast_ref::<WalletInput>()
-        .expect("Not Wallet input")
+        .context("Not Wallet input")
 }
 
-fn v0_output(output: &DynOutput) -> &WalletOutputV0 {
+fn v0_output(output: &DynOutput) -> anyhow::Result<&WalletOutputV0> {
     output
         .as_any()
         .downcast_ref::<WalletOutput>()
-        .expect("Not Wallet input")
+        .context("Not Wallet output")?
         .maybe_v0_ref()
-        .expect("Not v0")
+        .context("Unsupported WalletOutput version")
 }
 
 #[async_trait]
@@ -46,32 +47,30 @@ impl ObserverModule for WalletObserver {
         WalletCommonInit::decoder()
     }
 
-    fn summarize_input(&self, input: &DynInput) -> InputSummary {
-        let amount = match wallet_input(input) {
+    fn summarize_input(&self, input: &DynInput) -> anyhow::Result<InputSummary> {
+        let amount = match wallet_input(input)? {
             WalletInput::V0(wallet_input) => wallet_input.tx_output().value,
             WalletInput::V1(wallet_input) => wallet_input.tx_out.value,
-            _ => {
-                panic!("Unsupported WalletInput version");
-            }
+            _ => bail!("Unsupported WalletInput version"),
         };
 
-        InputSummary {
+        Ok(InputSummary {
             amount_msat: Some(amount.to_sat() * 1000),
             ln_contract_id: None,
             details: details_json::<WalletInput>(input.as_any(), input, "Wallet Transaction Input"),
-        }
+        })
     }
 
-    fn summarize_output(&self, output: &DynOutput) -> OutputSummary {
-        OutputSummary {
-            amount_msat: Some(v0_output(output).amount().to_sat() * 1000),
+    fn summarize_output(&self, output: &DynOutput) -> anyhow::Result<OutputSummary> {
+        Ok(OutputSummary {
+            amount_msat: Some(v0_output(output)?.amount().to_sat() * 1000),
             ln_contract: None,
             details: details_json::<WalletOutput>(
                 output.as_any(),
                 output,
                 "Wallet Transaction Output",
             ),
-        }
+        })
     }
 
     fn summarize_ci(&self, ci: &DynModuleConsensusItem) -> Option<serde_json::Value> {
@@ -85,7 +84,7 @@ impl ObserverModule for WalletObserver {
         input: &DynInput,
         summary: &InputSummary,
     ) -> anyhow::Result<()> {
-        let (outpoint, script) = match wallet_input(input) {
+        let (outpoint, script) = match wallet_input(input)? {
             WalletInput::V0(peg_in_proof) => {
                 let outpoint = peg_in_proof.outpoint();
                 let script = peg_in_proof.tx_output().script_pubkey;
@@ -93,12 +92,12 @@ impl ObserverModule for WalletObserver {
             }
             WalletInput::V1(v1) => (v1.outpoint, v1.tx_out.script_pubkey.clone()),
             WalletInput::Default { variant, .. } => {
-                panic!("WalletInput v{variant} not implemented");
+                bail!("WalletInput v{variant} not implemented");
             }
         };
 
         let address = bitcoin::Address::from_script(&script, bitcoin::Network::Bitcoin)
-            .expect("Invalid output address");
+            .context("Peg-in output has no address")?;
 
         ctx.dbtx
             .execute(
@@ -107,10 +106,9 @@ impl ObserverModule for WalletObserver {
                     &outpoint.txid[..].to_owned(),
                     &(outpoint.vout as i32),
                     &address.to_string(),
-                    &summary
+                    &(summary
                         .amount_msat
-                        .map(|amt| amt as i64)
-                        .expect("Wallet input must have amount"),
+                        .context("Wallet input must have amount")? as i64),
                     &meta.federation_id.consensus_encode_to_vec(),
                     &meta.txid.consensus_encode_to_vec(),
                     &(meta.index as i32),
@@ -127,12 +125,12 @@ impl ObserverModule for WalletObserver {
         output: &DynOutput,
         _summary: &OutputSummary,
     ) -> anyhow::Result<()> {
-        match v0_output(output) {
+        match v0_output(output)? {
             WalletOutputV0::PegOut(_) => {}
             WalletOutputV0::Rbf(_) => {
-                // panic, since the benefits may outweigh the annoyance of removing and
-                // restarting
-                panic!(
+                // Stop this federation's sync loudly: the benefits may outweigh
+                // the annoyance of removing and restarting
+                bail!(
                     r#"
                     You've discovered a terribly unfortunate situation: an RBF wallet output
 
@@ -166,7 +164,7 @@ impl ObserverModule for WalletObserver {
         let wallet_ci = ci
             .as_any()
             .downcast_ref::<WalletConsensusItem>()
-            .expect("config says this should be a wallet CI");
+            .context("config says this should be a wallet CI")?;
         match wallet_ci {
             WalletConsensusItem::BlockCount(height_vote) => {
                 dbtx.execute(
@@ -243,16 +241,19 @@ impl ObserverModule for WalletObserver {
                 }
 
                 let esplora_txid = esplora_client::Txid::from_str(peg_out_txid.as_str())
-                    .expect("Couldn't create esplora txid");
+                    .context("Couldn't create esplora txid")?;
 
                 let builder = esplora_client::Builder::new(ctx.mempool_url);
                 let client = builder
                     .build_async()
-                    .expect("Failed to build esplora client");
+                    .context("Failed to build esplora client")?;
 
+                // Bounded: this runs inside the session's database transaction.
+                // On failure the session is rolled back and retried 30 s later,
+                // instead of holding a pooled connection until esplora answers.
                 let fetched_tx = retry(
                     "fetching tx from esplora".to_string(),
-                    background_backoff(),
+                    aggressive_backoff(),
                     || async {
                         client.get_tx_no_opt(&esplora_txid).await.map_err(|e| {
                             warn!("failed to fetch tx: {e:?}");
@@ -261,7 +262,7 @@ impl ObserverModule for WalletObserver {
                     },
                 )
                 .await
-                .expect("Reached usize::MAX retries");
+                .with_context(|| format!("Fetching peg-out transaction {peg_out_txid}"))?;
 
                 for input in fetched_tx.input {
                     let prev_out_txid = input.previous_output.txid.to_byte_array().to_vec();
@@ -282,7 +283,7 @@ impl ObserverModule for WalletObserver {
                         bitcoin::Script::from_bytes(output.script_pubkey.as_bytes()),
                         bitcoin::Network::Bitcoin,
                     )
-                    .expect("Invalid bitcoin address");
+                    .context("Peg-out output has no address")?;
 
                     dbtx.execute(
                         "INSERT INTO wallet_withdrawal_transaction_outputs VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
@@ -302,5 +303,35 @@ impl ObserverModule for WalletObserver {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::core::{DynInput, DynOutput};
+    use fedimint_wallet_common::{WalletInput, WalletOutput};
+    use fmo_core::module::ObserverModule;
+
+    use super::WalletObserver;
+
+    #[test]
+    fn unsupported_versions_are_errors() {
+        let input = DynInput::from_typed(
+            0,
+            WalletInput::Default {
+                variant: 99,
+                bytes: vec![],
+            },
+        );
+        assert!(WalletObserver.summarize_input(&input).is_err());
+
+        let output = DynOutput::from_typed(
+            0,
+            WalletOutput::Default {
+                variant: 99,
+                bytes: vec![],
+            },
+        );
+        assert!(WalletObserver.summarize_output(&output).is_err());
     }
 }
