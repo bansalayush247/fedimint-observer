@@ -2625,7 +2625,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "stability-pool-common",
  "tokio",
  "tokio-postgres",
  "tower-http 0.5.2",
@@ -2656,6 +2655,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fmo_module_stability_pool"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "fedimint-core 0.12.0",
+ "fmo_core",
+ "serde_json",
+ "stability-pool-common",
+]
+
+[[package]]
 name = "fmo_module_wallet"
 version = "0.2.0"
 dependencies = [
@@ -2678,6 +2688,7 @@ dependencies = [
  "fmo_core",
  "fmo_module_ln",
  "fmo_module_mint",
+ "fmo_module_stability_pool",
  "fmo_module_wallet",
  "tokio",
 ]

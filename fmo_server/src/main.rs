@@ -5,10 +5,11 @@ use fmo_module_wallet::WalletObserver;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    FedimintObserver::builder()
+    let builder = FedimintObserver::builder()
         .with_module(MintObserver)
         .with_module(WalletObserver)
-        .with_module(LnObserver)
-        .run()
-        .await
+        .with_module(LnObserver);
+    #[cfg(feature = "stability_pool_v1")]
+    let builder = builder.with_module(fmo_module_stability_pool::StabilityPoolObserver);
+    builder.run().await
 }
