@@ -26,7 +26,6 @@ use fedimint_ln_common::contracts::{Contract, IdentifiableContract};
 use fedimint_ln_common::{
     LightningConsensusItem, LightningInput, LightningOutput, LightningOutputV0,
 };
-use fedimint_mint_common::{MintConsensusItem, MintInput, MintOutput};
 use fedimint_wallet_common::endpoint_constants::WALLET_SUMMARY_ENDPOINT;
 use fedimint_wallet_common::{
     TxOutputSummary, WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0, WalletSummary,
@@ -882,18 +881,6 @@ impl FederationObserver {
 
                     (Some(input.amount.msats), Some(input.contract_id))
                 }
-                "mint" => {
-                    let amount_msat = input
-                        .as_any()
-                        .downcast_ref::<MintInput>()
-                        .expect("Not Mint input")
-                        .maybe_v0_ref()
-                        .expect("Not v0")
-                        .amount
-                        .msats;
-
-                    (Some(amount_msat), None)
-                }
                 "wallet" => {
                     let amount = match input
                         .as_any()
@@ -982,18 +969,6 @@ impl FederationObserver {
 
             let json_txi: Option<serde_json::Value> = match kind.as_str() {
                 _ if module.is_some() => summary.details.clone(),
-                "mint" => match input.as_any().downcast_ref::<MintInput>() {
-                    Some(input) => {
-                        let value = serde_json::to_value(input)
-                            .expect("Should be able to serialize to JSON");
-                        debug!("found Mint Transaction Input: {value:?}");
-                        Some(value)
-                    }
-                    None => {
-                        warn!("could not downcast (check decoders registry). {input:?}");
-                        None
-                    }
-                },
                 "wallet" => match input.as_any().downcast_ref::<WalletInput>() {
                     Some(input) => {
                         let value = serde_json::to_value(input)
@@ -1100,17 +1075,6 @@ impl FederationObserver {
                         Some((ln_contract_interaction_kind, contract_id)),
                     )
                 }
-                "mint" => {
-                    let amount_msat = output
-                        .as_any()
-                        .downcast_ref::<MintOutput>()
-                        .expect("Not Mint input")
-                        .maybe_v0_ref()
-                        .expect("Not v0")
-                        .amount
-                        .msats;
-                    (Some(amount_msat), None)
-                }
                 "wallet" => {
                     let amount_msat = output
                         .as_any()
@@ -1197,18 +1161,6 @@ impl FederationObserver {
 
             let json_txo: Option<serde_json::Value> = match kind.as_str() {
                 _ if module.is_some() => summary.details.clone(),
-                "mint" => match output.as_any().downcast_ref::<MintOutput>() {
-                    Some(output) => {
-                        let value = serde_json::to_value(output)
-                            .expect("Should be able to serialize to JSON");
-                        debug!("found Mint Transaction Output: {value:?}");
-                        Some(value)
-                    }
-                    None => {
-                        warn!("could not downcast (check decoders registry). {output:?}");
-                        None
-                    }
-                },
                 "wallet" => match output.as_any().downcast_ref::<WalletOutput>() {
                     Some(output) => {
                         let value = serde_json::to_value(output)
@@ -1288,18 +1240,6 @@ impl FederationObserver {
 
         let json_ci: Option<serde_json::Value> = match kind.as_str() {
             _ if module.is_some() => module.and_then(|module| module.summarize_ci(&ci)),
-            "mint" => match ci.as_any().downcast_ref::<MintConsensusItem>() {
-                Some(ci) => {
-                    let value =
-                        serde_json::to_value(ci).expect("Should be able to serialize to JSON");
-                    debug!("found Mint CI: {value:?}");
-                    Some(value)
-                }
-                None => {
-                    warn!("could not downcast (check decoders registry). {ci:?}");
-                    None
-                }
-            },
             "wallet" => match ci.as_any().downcast_ref::<WalletConsensusItem>() {
                 Some(ci) => {
                     let value =

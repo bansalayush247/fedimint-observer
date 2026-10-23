@@ -2,6 +2,7 @@
 members = [
     "fmo_api_types",
     "fmo_core",
+    "fmo_modules/fmo_module_mint",
     "fmo_server",
 ]
 

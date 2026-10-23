@@ -66,7 +66,8 @@ just test_package fmo_core
 ### Workspace Structure
 - `fmo_api_types/` - Shared API types between frontend and backend
 - `fmo_core/` - Backend library (Axum + PostgreSQL): fetching, storage, API and shared services
-- `fmo_server/` - Thin binary that runs `fmo_core`
+- `fmo_modules/` - One crate per Fedimint module (`fmo_module_mint` so far): decoding and processing of that module's inputs, outputs and consensus items
+- `fmo_server/` - The default build: `FedimintObserver::builder().with_module(...)` with the modules moved so far
   - `/config/*` endpoints - Federation configuration API (stable)
   - `/federations/*` endpoints - Federation monitoring API (unstable)
   - Background tasks for monitoring federations and syncing data

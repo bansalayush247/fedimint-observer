@@ -2,11 +2,12 @@
 name = "fmo_server"
 version = "0.2.0"
 edition = "2021"
-description = "The Fedimint Observer binary"
+description = "The default Fedimint Observer build"
 
 [dependencies]
 anyhow = "1.0.81"
 fmo_core = { path = "../fmo_core" }
+fmo_module_mint = { path = "../fmo_modules/fmo_module_mint" }
 tokio = { version = "1.37.0", features = ["full"] }
 
 [features]

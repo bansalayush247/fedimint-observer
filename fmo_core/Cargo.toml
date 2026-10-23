@@ -12,7 +12,6 @@ fedimint-connectors = { workspace = true }
 fedimint-core = { workspace = true }
 fedimint-ln-common = { workspace = true }
 fedimint-meta-client = { workspace = true }
-fedimint-mint-common = { workspace = true }
 fedimint-wallet-common = { workspace = true }
 
 anyhow = "1.0.81"
