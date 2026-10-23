@@ -2,8 +2,8 @@ use deadpool_postgres::GenericClient;
 use fedimint_core::config::{ClientConfig, ClientModuleConfig, JsonClientConfig, JsonWithKind};
 use fedimint_core::core::{Decoder, ModuleKind};
 use fedimint_core::encoding::DynRawFallback;
+#[cfg(feature = "stability_pool_v1")]
 use fedimint_core::module::CommonModuleInit;
-use fedimint_wallet_common::WalletCommonInit;
 use hex::ToHex;
 use postgres_from_row::FromRow;
 use serde_json::json;
@@ -56,16 +56,13 @@ pub fn config_to_json(
 /// Decoder of a module kind core still handles itself, until the kind moves
 /// into its own module crate
 pub fn builtin_decoder(module_kind: &ModuleKind) -> Option<Decoder> {
-    let decoder = match module_kind.as_str() {
-        "wallet" => WalletCommonInit::decoder(),
-        #[cfg(feature = "stability_pool_v1")]
-        "stability_pool" => StabilityPoolCommonGen::decoder(),
-        _ => {
-            return None;
-        }
-    };
+    #[cfg(feature = "stability_pool_v1")]
+    if module_kind.as_str() == "stability_pool" {
+        return Some(StabilityPoolCommonGen::decoder());
+    }
 
-    Some(decoder)
+    let _ = module_kind;
+    None
 }
 
 pub async fn execute(

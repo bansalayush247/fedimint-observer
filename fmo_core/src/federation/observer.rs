@@ -23,9 +23,7 @@ use fedimint_core::util::backoff_util::background_backoff;
 use fedimint_core::util::retry;
 use fedimint_core::{Amount, PeerId};
 use fedimint_wallet_common::endpoint_constants::WALLET_SUMMARY_ENDPOINT;
-use fedimint_wallet_common::{
-    TxOutputSummary, WalletConsensusItem, WalletInput, WalletOutput, WalletOutputV0, WalletSummary,
-};
+use fedimint_wallet_common::{TxOutputSummary, WalletInput, WalletSummary};
 use fmo_api_types::{
     FederationActivity, FederationHealth, FederationSummary, FederationUtxo, FedimintTotals,
     GuardianClaimedUtxo, GuardianClaimedUtxoState, GuardianUtxoClaim, GuardianUtxoClaimStatus,
@@ -865,34 +863,9 @@ impl FederationObserver {
             // Kinds without a module crate in the build yet are still handled
             // inline here
             let module = self.modules.get(&kind);
-            let maybe_amount_msat = match kind.as_str() {
-                _ if module.is_some() => None,
-                "wallet" => {
-                    let amount = match input
-                        .as_any()
-                        .downcast_ref::<WalletInput>()
-                        .expect("Not Wallet input")
-                    {
-                        WalletInput::V0(wallet_input) => wallet_input.tx_output().value,
-                        WalletInput::V1(wallet_input) => wallet_input.tx_out.value,
-                        _ => {
-                            panic!("Unsupported WalletInput version");
-                        }
-                    };
-
-                    let amount_msat = amount.to_sat() * 1000;
-
-                    Some(amount_msat)
-                }
-                _ => None,
-            };
             let summary = match module {
                 Some(module) => module.summarize_input(&input),
-                None => InputSummary {
-                    amount_msat: maybe_amount_msat,
-                    ln_contract_id: None,
-                    details: None,
-                },
+                None => InputSummary::default(),
             };
 
             dbtx.execute(
@@ -919,54 +892,8 @@ impl FederationObserver {
                 module.process_input(&ctx, &meta, &input, &summary).await?;
             }
 
-            if module.is_none() && kind.as_str() == "wallet" {
-                let (outpoint, script) = match input
-                    .as_any()
-                    .downcast_ref::<WalletInput>()
-                    .expect("Not Wallet input")
-                {
-                    WalletInput::V0(peg_in_proof) => {
-                        let outpoint = peg_in_proof.outpoint();
-                        let script = peg_in_proof.tx_output().script_pubkey;
-                        (outpoint, script)
-                    }
-                    WalletInput::V1(v1) => (v1.outpoint, v1.tx_out.script_pubkey.clone()),
-                    WalletInput::Default { variant, .. } => {
-                        panic!("WalletInput v{variant} not implemented");
-                    }
-                };
-
-                let address = bitcoin::Address::from_script(&script, bitcoin::Network::Bitcoin)
-                    .expect("Invalid output address");
-
-                dbtx.execute(
-                        "INSERT INTO wallet_peg_ins VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
-                        &[
-                            &outpoint.txid[..].to_owned(),
-                            &(outpoint.vout as i32),
-                            &address.to_string(),
-                            &maybe_amount_msat.map(|amt| amt as i64).expect("Wallet input must have amount"),
-                            &federation_id.consensus_encode_to_vec(),
-                            &fedimint_txid.consensus_encode_to_vec(),
-                            &(in_idx as i32),
-                        ]
-                    ).await?;
-            }
-
             let json_txi: Option<serde_json::Value> = match kind.as_str() {
                 _ if module.is_some() => summary.details.clone(),
-                "wallet" => match input.as_any().downcast_ref::<WalletInput>() {
-                    Some(input) => {
-                        let value = serde_json::to_value(input)
-                            .expect("Should be able to serialize to JSON");
-                        debug!("found Wallet Transaction Input: {value:?}");
-                        Some(value)
-                    }
-                    None => {
-                        warn!("could not downcast (check decoders registry). {input:?}");
-                        None
-                    }
-                },
                 #[cfg(feature = "stability_pool_v1")]
                 "stability_pool" => match input.as_any().downcast_ref::<StabilityPoolInput>() {
                     Some(input) => {
@@ -1004,29 +931,9 @@ impl FederationObserver {
         for (out_idx, output) in transaction.outputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, output.module_instance_id());
             let module = self.modules.get(&kind);
-            let maybe_amount_msat = match kind.as_str() {
-                _ if module.is_some() => None,
-                "wallet" => {
-                    let amount_msat = output
-                        .as_any()
-                        .downcast_ref::<WalletOutput>()
-                        .expect("Not Wallet input")
-                        .maybe_v0_ref()
-                        .expect("Not v0")
-                        .amount()
-                        .to_sat()
-                        * 1000;
-                    Some(amount_msat)
-                }
-                _ => None,
-            };
             let summary = match module {
                 Some(module) => module.summarize_output(&output),
-                None => OutputSummary {
-                    amount_msat: maybe_amount_msat,
-                    ln_contract: None,
-                    details: None,
-                },
+                None => OutputSummary::default(),
             };
 
             dbtx.execute(
@@ -1056,53 +963,8 @@ impl FederationObserver {
                     .await?;
             }
 
-            if module.is_none() && kind.as_str() == "wallet" {
-                let wallet_v0_output = output
-                    .as_any()
-                    .downcast_ref::<WalletOutput>()
-                    .expect("Not Wallet input")
-                    .maybe_v0_ref()
-                    .expect("Not v0");
-
-                match wallet_v0_output {
-                    WalletOutputV0::PegOut(_) => {}
-                    WalletOutputV0::Rbf(_) => {
-                        // panic, since the benefits may outweigh the annoyance of removing and
-                        // restarting
-                        panic!(
-                            r#"
-                            You've discovered a terribly unfortunate situation: an RBF wallet output
-
-                            Federation ID: {}
-                            Name: {}
-
-                            If you know any of the guardians of the federation, please give them a heads up
-                            that they should expect failures re-syncing, or worse. They can reach out to the
-                            core dev team on Discord (chat.fedimint.org).
-
-                            For more context, see: https://github.com/fedimint/fedimint/pull/5496
-                        "#,
-                            federation_id,
-                            config.global.federation_name().unwrap_or("no name defined"),
-                        );
-                    }
-                }
-            }
-
             let json_txo: Option<serde_json::Value> = match kind.as_str() {
                 _ if module.is_some() => summary.details.clone(),
-                "wallet" => match output.as_any().downcast_ref::<WalletOutput>() {
-                    Some(output) => {
-                        let value = serde_json::to_value(output)
-                            .expect("Should be able to serialize to JSON");
-                        debug!("found Wallet Transaction Output: {value:?}");
-                        Some(value)
-                    }
-                    None => {
-                        warn!("could not downcast (check decoders registry). {output:?}");
-                        None
-                    }
-                },
                 #[cfg(feature = "stability_pool_v1")]
                 "stability_pool" => match output.as_any().downcast_ref::<StabilityPoolOutput>() {
                     Some(output) => {
@@ -1158,18 +1020,6 @@ impl FederationObserver {
 
         let json_ci: Option<serde_json::Value> = match kind.as_str() {
             _ if module.is_some() => module.and_then(|module| module.summarize_ci(&ci)),
-            "wallet" => match ci.as_any().downcast_ref::<WalletConsensusItem>() {
-                Some(ci) => {
-                    let value =
-                        serde_json::to_value(ci).expect("Should be able to serialize to JSON");
-                    debug!("found Wallet CI: {value:?}");
-                    Some(value)
-                }
-                None => {
-                    warn!("could not downcast (check decoders registry). {ci:?}");
-                    None
-                }
-            },
             #[cfg(feature = "stability_pool_v1")]
             "stability_pool" => match ci.as_any().downcast_ref::<StabilityPoolConsensusItem>() {
                 Some(ci) => {
@@ -1217,149 +1067,6 @@ impl FederationObserver {
                 peer: peer_id,
             };
             return module.process_ci(&ctx, &meta, &ci).await;
-        }
-
-        if kind != "wallet" {
-            return Ok(());
-        }
-
-        let wallet_ci = ci
-            .as_any()
-            .downcast_ref::<WalletConsensusItem>()
-            .expect("config says this should be a wallet CI");
-        match wallet_ci {
-            WalletConsensusItem::BlockCount(height_vote) => {
-                dbtx.execute(
-                    "INSERT INTO block_height_votes VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-                    &[
-                        &federation_id.consensus_encode_to_vec(),
-                        &(session_index as i32),
-                        &(item_index as i32),
-                        &(peer_id.to_usize() as i32),
-                        &(*height_vote as i32),
-                    ],
-                )
-                .await?;
-            }
-            WalletConsensusItem::PegOutSignature(peg_out_sig) => {
-                let peg_out_txid = peg_out_sig.txid.to_string();
-                let peg_out_txid_encoded = peg_out_sig.txid.to_byte_array().to_vec();
-
-                dbtx.execute(
-                    "INSERT INTO wallet_withdrawal_transactions (on_chain_txid, federation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    &[
-                        &peg_out_txid_encoded,
-                        &federation_id.consensus_encode_to_vec(),
-                    ],
-                )
-                .await?;
-
-                dbtx.execute(
-                    "INSERT INTO wallet_withdrawal_signatures VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-                    &[
-                        &peg_out_txid_encoded,
-                        &(session_index as i32),
-                        &(item_index as i32),
-                        &(peer_id.to_usize() as i32),
-                    ],
-                )
-                .await?;
-
-                let num_sigs = dbtx
-                    .query_one(
-                        "
-                        SELECT COUNT(peer_id)::INT num_sigs
-                        FROM wallet_withdrawal_signatures
-                        WHERE on_chain_txid = $1
-                        GROUP BY on_chain_txid
-                        ",
-                        &[&peg_out_txid_encoded],
-                    )
-                    .await?
-                    .get::<_, i32>("num_sigs") as usize;
-
-                // 3n + 1 <= num_peers
-                // n <= (num_peers - 1) / 3
-                // threshold = num_peers - floor((num_peers - 1) / 3)
-                let threshold = {
-                    let num_peers = config.global.api_endpoints.len();
-                    num_peers - (num_peers - 1) / 3
-                };
-
-                if num_sigs < threshold {
-                    return Ok(());
-                }
-
-                // at this point, the transaction reached threshold and should broadcast
-
-                let cached: bool = dbtx.query_one(
-                    "SELECT EXISTS(SELECT 1 FROM wallet_withdrawal_transaction_outputs WHERE on_chain_txid=$1)",
-                    &[&peg_out_txid_encoded],
-                ).await?.get(0);
-                // Every signature after the threshold lands here too; the
-                // transaction only needs fetching once
-                if cached {
-                    return Ok(());
-                }
-
-                let esplora_txid = esplora_client::Txid::from_str(peg_out_txid.as_str())
-                    .expect("Couldn't create esplora txid");
-
-                let builder = esplora_client::Builder::new(mempool_url);
-                let client = builder
-                    .build_async()
-                    .expect("Failed to build esplora client");
-
-                let fetched_tx = retry(
-                    "fetching tx from esplora".to_string(),
-                    background_backoff(),
-                    || async {
-                        client.get_tx_no_opt(&esplora_txid).await.map_err(|e| {
-                            warn!("failed to fetch tx: {e:?}");
-                            anyhow::anyhow!("failed fetching tx from esplora")
-                        })
-                    },
-                )
-                .await
-                .expect("Reached usize::MAX retries");
-
-                for input in fetched_tx.input {
-                    let prev_out_txid = input.previous_output.txid.to_byte_array().to_vec();
-
-                    dbtx.execute(
-                        "INSERT INTO wallet_withdrawal_transaction_inputs VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                        &[
-                            &prev_out_txid,
-                            &(input.previous_output.vout as i32),
-                            &peg_out_txid_encoded,
-                        ],
-                    )
-                    .await?;
-                }
-
-                for (out_idx, output) in fetched_tx.output.iter().enumerate() {
-                    let address = bitcoin::Address::from_script(
-                        bitcoin::Script::from_bytes(output.script_pubkey.as_bytes()),
-                        bitcoin::Network::Bitcoin,
-                    )
-                    .expect("Invalid bitcoin address");
-
-                    dbtx.execute(
-                        "INSERT INTO wallet_withdrawal_transaction_outputs VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-                        &[
-                            &peg_out_txid_encoded,
-                            &(out_idx as i32),
-                            &address.to_string(),
-                            &((output.value.to_sat() as i64) * 1000),
-
-                        ],
-                    )
-                    .await?;
-                }
-            }
-            _ => {
-                // other WalletConsesnsusItems are not needed yet
-            }
         }
 
         Ok(())
