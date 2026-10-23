@@ -39,14 +39,13 @@ use tracing::log::info;
 use tracing::{debug, info_span, warn, Instrument};
 
 use crate::config::meta::{ConsensusMetaCache, MetaFieldsExt};
-use crate::db::DbMigration;
+use crate::db::{migration, migration_backfill, schema_setup, DbMigration};
 use crate::federation::db::Federation;
 use crate::federation::gateways::GatewayOverviewCache;
 use crate::federation::{db, instance_to_kind};
 use crate::module::{CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx};
 use crate::task::supervise;
 use crate::util::{execute, query, query_one, query_opt, query_value};
-use crate::{migration, migration_backfill, schema_setup};
 
 /// Guardian wallet summaries younger than this are reused, so page views don't
 /// each send a request to every guardian.
@@ -1108,13 +1107,6 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<Amount> {
-        // Unfortunately SQLx has a bug where the integer parsing logic of the Any DB
-        // type always uses signed 32bit integer decoding when receiving integer values
-        // from SQLite. This is probably due to SQLite lacking the distinction between
-        // integer types and just calling everything INTEGER and always using 64bit
-        // representations while any other DBMS will call 64bit integers BIGINT or
-        // something similar. That's why we serialize the number to a string and the
-        // deserialize again in rust.
         let total_assets_msat = query_value::<i64>(
             &self.connection().await?,
             "

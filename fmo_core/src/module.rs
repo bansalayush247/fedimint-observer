@@ -130,7 +130,7 @@ pub trait ObserverModule: Send + Sync + 'static {
 }
 
 /// The modules an observer build includes, by kind
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ModuleRegistry {
     modules: Arc<BTreeMap<String, Arc<dyn ObserverModule>>>,
 }

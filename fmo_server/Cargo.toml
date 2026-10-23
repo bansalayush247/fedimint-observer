@@ -11,7 +11,7 @@ fmo_module_ln = { path = "../fmo_modules/fmo_module_ln" }
 fmo_module_mint = { path = "../fmo_modules/fmo_module_mint" }
 fmo_module_stability_pool = { path = "../fmo_modules/fmo_module_stability_pool", optional = true }
 fmo_module_wallet = { path = "../fmo_modules/fmo_module_wallet" }
-tokio = { version = "1.37.0", features = ["full"] }
+tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread"] }
 
 [features]
 # Off by default: it doesn't build with this fedimint version yet

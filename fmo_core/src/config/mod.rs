@@ -9,8 +9,6 @@ use axum::{Json, Router};
 use fedimint_core::config::{FederationId, JsonClientConfig};
 use fedimint_core::invite_code::InviteCode;
 use fmo_api_types::GatewayInfo;
-use reqwest::Method;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
 use crate::config::id::fetch_federation_id;
@@ -30,25 +28,14 @@ pub mod meta;
 
 /// Helper API that exposes the federation modules
 pub mod modules;
+/// CORS for these routes comes from the permissive layer on the whole app
 pub fn get_config_routes() -> Router<AppState> {
-    let router = Router::new()
+    Router::new()
         .route("/:invite", get(fetch_federation_config))
         .route("/:invite/gateways", get(fetch_federation_gateways))
         .route("/:invite/meta", get(fetch_federation_meta))
         .route("/:invite/id", get(fetch_federation_id))
-        .route("/:invite/module_kinds", get(fetch_federation_module_kinds));
-
-    let cors_enabled = dotenv::var("ALLOW_CONFIG_CORS").is_ok_and(|v| v == "true");
-
-    if cors_enabled {
-        router.layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET]),
-        )
-    } else {
-        router
-    }
+        .route("/:invite/module_kinds", get(fetch_federation_module_kinds))
 }
 
 pub async fn fetch_federation_config(
@@ -99,7 +86,6 @@ impl FederationConfigCache {
         }
         if let Some(replaced) = cache.insert(federation_id, config.clone()) {
             if replaced != config {
-                // TODO: use tracing
                 warn!("Config for federation {federation_id} changed");
             }
         }

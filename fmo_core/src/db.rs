@@ -62,7 +62,6 @@ impl DbMigration {
     }
 }
 
-#[macro_export]
 macro_rules! schema_setup {
     ($sql_path:expr) => {
         DbMigration::schema_setup(include_str!(concat!(
@@ -73,7 +72,6 @@ macro_rules! schema_setup {
     };
 }
 
-#[macro_export]
 macro_rules! migration {
     ($sql_path:expr) => {
         DbMigration::migration(include_str!(concat!(
@@ -84,7 +82,6 @@ macro_rules! migration {
     };
 }
 
-#[macro_export]
 macro_rules! migration_backfill {
     ($sql_path:expr, $backfill:expr) => {
         DbMigration::migration_backfill(
@@ -93,3 +90,7 @@ macro_rules! migration_backfill {
         )
     };
 }
+
+pub(crate) use migration;
+pub(crate) use migration_backfill;
+pub(crate) use schema_setup;

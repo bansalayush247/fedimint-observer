@@ -76,7 +76,7 @@ just test_package fmo_core
 - `fmo_frontend_react/` - Frontend (React + TypeScript)
 
 ### Key Patterns
-1. **Shared Types**: All API types are defined in `fmo_api_types` and used by both frontend and backend
+1. **Shared Types**: API types are defined in `fmo_api_types` for the backend; the React frontend mirrors them by hand in `fmo_frontend_react/src/types/api.ts`, so keep both in sync
 2. **Database Migrations**: Version-controlled SQL migrations in `fmo_core/schema/` (v0-v11)
 3. **Modules**: Core writes the module-agnostic rows of every session item from the summary the owning module returns, then lets the module write its own tables in the same transaction. Kinds without a module in the build are stored without amounts or details, and adding the module later does not fill them in yet (core rows are written once). The default build must keep mint, wallet and ln: the v8 and v11 backfills need them. Module-specific API endpoints and background tasks (UTXOs, nonces, gateways) still live in `fmo_core`.
 4. **Background Monitoring**: `FederationObserver` spawns tasks to monitor multiple federations concurrently
@@ -84,12 +84,11 @@ just test_package fmo_core
 6. **Error Handling**: Custom `AppError` type wrapping `anyhow::Error` for consistent error propagation
 
 ### Environment Configuration
-Required environment variables (see `sample.env`):
+Required environment variables (`sample.env` is a template; the server does not load `.env` itself, so export it first: `set -a; . ./.env; set +a`):
 - `FO_BIND`: Server bind address (e.g., "127.0.0.1:3000")
 - `FO_DATABASE`: PostgreSQL connection string
 - `FO_ADMIN_AUTH`: Admin authentication password
 - `FO_MEMPOOL_URL`: Mempool API URL (default: "https://mempool.space/api")
-- `ALLOW_CONFIG_CORS`: Enable CORS for config endpoints
 
 ### API Endpoints
 - **Config API** (`/config/*`): Stable API for federation configuration inspection
@@ -101,5 +100,5 @@ PostgreSQL with materialized views and complex indexes. Key tables:
 - `federations` - Federation configurations
 - `sessions` - Consensus sessions
 - `transactions` - Transaction records
-- `guardian_health_*` - Guardian monitoring data
+- `guardian_health` - Guardian monitoring data
 - `nostr_*` - Nostr protocol integration
