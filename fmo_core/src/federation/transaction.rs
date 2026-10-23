@@ -7,7 +7,7 @@ use axum::Json;
 use chrono::NaiveDate;
 use fedimint_core::config::FederationId;
 use fedimint_core::core::{DynInput, DynOutput, DynUnknown};
-use fedimint_core::encoding::Encodable;
+use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::{Amount, TransactionId};
 use fmo_api_types::FederationActivity;
 use postgres_from_row::FromRow;
@@ -24,11 +24,8 @@ pub(super) async fn list_transactions(
 ) -> crate::error::Result<Json<Vec<TransactionId>>> {
     Ok(state
         .federation_observer
-        .federation_transaction_list(federation_id)
+        .federation_transaction_ids(federation_id)
         .await?
-        .into_iter()
-        .map(|tx| tx.txid)
-        .collect::<Vec<_>>()
         .into())
 }
 
@@ -77,19 +74,31 @@ pub(super) async fn transaction_histogram(
 }
 
 impl FederationObserver {
-    pub async fn federation_transaction_list(
+    pub async fn federation_transaction_ids(
         &self,
         federation_id: FederationId,
-    ) -> anyhow::Result<Vec<db::Transaction>> {
+    ) -> anyhow::Result<Vec<TransactionId>> {
         self.get_federation(federation_id)
-            .await
+            .await?
             .context("Federation doesn't exist")?;
 
-        query::<db::Transaction>(
-            &self.connection().await?,
-            "SELECT txid, session_index, item_index, data FROM transactions WHERE federation_id = $1",
-            &[&federation_id.consensus_encode_to_vec()]
-        ).await
+        // Only the ids: decoding every transaction blob of a large federation
+        // (hundreds of MB) just to drop it was most of this endpoint's cost
+        self.connection()
+            .await?
+            .query(
+                "SELECT txid FROM transactions WHERE federation_id = $1",
+                &[&federation_id.consensus_encode_to_vec()],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(TransactionId::consensus_decode_whole(
+                    &row.get::<_, Vec<u8>>("txid"),
+                    &Default::default(),
+                )?)
+            })
+            .collect()
     }
 
     pub async fn federation_transaction_count(
@@ -97,7 +106,7 @@ impl FederationObserver {
         federation_id: FederationId,
     ) -> anyhow::Result<u64> {
         self.get_federation(federation_id)
-            .await
+            .await?
             .context("Federation doesn't exist")?;
 
         Ok(query_value::<i64>(
@@ -119,7 +128,15 @@ impl FederationObserver {
             .context("Federation doesn't exist")?
             .config;
 
-        let tx = query_one::<db::Transaction>(&self.connection().await?, "SELECT txid, session_index, item_index, data FROM transactions WHERE federation_id = $1 AND txid = $2", &[&federation_id.consensus_encode_to_vec(), &transaction_id.consensus_encode_to_vec()]).await?;
+        let tx = query_one::<db::Transaction>(
+            &self.connection().await?,
+            "SELECT data FROM transactions WHERE federation_id = $1 AND txid = $2",
+            &[
+                &federation_id.consensus_encode_to_vec(),
+                &transaction_id.consensus_encode_to_vec(),
+            ],
+        )
+        .await?;
 
         let decoders = self.modules().decoders_for_config(&cfg);
 
@@ -199,6 +216,8 @@ impl FederationObserver {
                   FROM transaction_inputs
                   GROUP BY txid, federation_id) ti ON t.txid = ti.txid AND t.federation_id = ti.federation_id
             WHERE t.federation_id = $1
+              -- Sessions before the first block height vote have no time yet
+              AND st.estimated_session_timestamp IS NOT NULL
             GROUP BY date
             ORDER BY date;
         ";

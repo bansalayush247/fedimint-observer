@@ -32,6 +32,7 @@ use fmo_api_types::{
 use futures::future::join_all;
 use futures::StreamExt;
 use postgres_from_row::FromRow;
+use subtle::ConstantTimeEq;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 use tracing::log::info;
@@ -59,6 +60,8 @@ const ONCHAIN_CHECK_TTL: Duration = Duration::from_secs(10 * 60);
 /// arrive in time are cached, so a later load continues where this one stopped.
 const ONCHAIN_CHECK_DEADLINE: Duration = Duration::from_secs(8);
 const ONCHAIN_CHECK_CONCURRENCY: usize = 8;
+/// Each nonce is matched against the federation's mint inputs
+const MAX_NONCES_PER_REQUEST: usize = 1000;
 
 /// State of a transaction output according to the blockchain
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +89,7 @@ pub struct FederationObserver {
     onchain_cache: Arc<Mutex<HashMap<OutPoint, (Instant, OnChainOutput)>>>,
     gateway_overviews: GatewayOverviewCache,
     modules: ModuleRegistry,
+    nostr_pool: Arc<tokio::sync::OnceCell<nostr_sdk::RelayPool>>,
 }
 
 impl FederationObserver {
@@ -98,6 +102,16 @@ impl FederationObserver {
         let connection_pool = {
             let pool_config = deadpool_postgres::Config {
                 url: Some(database.to_owned()),
+                pool: Some(deadpool_postgres::PoolConfig {
+                    // Fail with an error instead of hanging when every
+                    // connection is busy or the database doesn't answer
+                    timeouts: deadpool_postgres::Timeouts {
+                        wait: Some(Duration::from_secs(30)),
+                        create: Some(Duration::from_secs(10)),
+                        recycle: Some(Duration::from_secs(10)),
+                    },
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             pool_config.create_pool(Some(Runtime::Tokio1), NoTls)
@@ -116,6 +130,7 @@ impl FederationObserver {
             onchain_cache: Default::default(),
             gateway_overviews: Default::default(),
             modules,
+            nostr_pool: Default::default(),
         };
 
         slf.setup_schema().await?;
@@ -172,12 +187,22 @@ impl FederationObserver {
         Ok(slf)
     }
 
+    /// Shared with the API so the list page and the meta endpoints agree and
+    /// each federation's consensus meta is fetched once
+    pub(crate) fn consensus_meta_cache(&self) -> &ConsensusMetaCache {
+        &self.consensus_meta_cache
+    }
+
     pub fn connectors(&self) -> &ConnectorRegistry {
         &self.connectors
     }
 
     pub fn modules(&self) -> &ModuleRegistry {
         &self.modules
+    }
+
+    pub(crate) fn nostr_pool(&self) -> &tokio::sync::OnceCell<nostr_sdk::RelayPool> {
+        &self.nostr_pool
     }
 
     pub(crate) fn gateway_overviews(&self) -> &GatewayOverviewCache {
@@ -525,7 +550,7 @@ impl FederationObserver {
 
                 let name = self
                     .consensus_meta_cache
-                    .fetch_meta_cached(&federation.config.to_json())
+                    .fetch_meta_cached(&federation.config.to_json(), &self.connectors)
                     .await
                     .and_then(|meta| meta.get_as::<String>("federation_name"))
                     .or_else(|| {
@@ -664,7 +689,12 @@ impl FederationObserver {
 
     // FIXME: use middleware for auth and get it out of here
     pub fn check_auth(&self, bearer_token: &str) -> anyhow::Result<()> {
-        ensure!(self.admin_auth == bearer_token, "Invalid bearer token");
+        // Constant time, so response timing doesn't reveal how much of a
+        // guessed token is right
+        ensure!(
+            bool::from(self.admin_auth.as_bytes().ct_eq(bearer_token.as_bytes())),
+            "Invalid bearer token"
+        );
         Ok(())
     }
 
@@ -759,7 +789,7 @@ impl FederationObserver {
         let decoders = self.modules.decoders_for_config(&config);
 
         info!("Starting background job for {federation_id}");
-        let next_session = self.federation_session_count(federation_id).await?;
+        let next_session = self.next_session_index(federation_id).await?;
         debug!("Next session {next_session}");
         let api_fetch = api.clone();
         let mut session_stream = futures::stream::iter(next_session..)
@@ -1136,6 +1166,10 @@ impl FederationObserver {
         &self,
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<GuardianUtxoClaim>> {
+        // Unknown ids from the request path must not get a cache slot each
+        self.get_federation(federation_id)
+            .await?
+            .context("Federation not observed")?;
         let slot = self
             .guardian_claims_cache
             .lock()
@@ -1386,6 +1420,10 @@ impl FederationObserver {
         if nonces.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        ensure!(
+            nonces.len() <= MAX_NONCES_PER_REQUEST,
+            "At most {MAX_NONCES_PER_REQUEST} nonces can be checked per request"
+        );
 
         let _ = self
             .get_federation(federation_id)

@@ -134,7 +134,7 @@ impl FederationObserver {
     ) -> anyhow::Result<BTreeMap<PeerId, GuardianHealth>> {
         let _federation = self
             .get_federation(federation_id)
-            .await
+            .await?
             .context("Unknown federation")?;
 
         let health_rows = query::<GuardianHealthRow>(

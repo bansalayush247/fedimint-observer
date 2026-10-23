@@ -1,7 +1,6 @@
 use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::encoding::Decodable;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
-use fedimint_core::TransactionId;
 use postgres_from_row::FromRow;
 use tokio_postgres::{Error, Row};
 
@@ -33,12 +32,9 @@ impl FromRow for Federation {
     }
 }
 
+/// A stored transaction, decoded with the fallback decoder only: module items
+/// stay undecoded until the caller decodes them with the module decoders
 pub struct Transaction {
-    pub txid: TransactionId,
-    #[allow(dead_code)]
-    pub session_index: i32,
-    #[allow(dead_code)]
-    pub item_index: i32,
     pub data: fedimint_core::transaction::Transaction,
 }
 
@@ -49,26 +45,12 @@ impl FromRow for crate::federation::db::Transaction {
 
     fn try_from_row(row: &Row) -> Result<Self, Error> {
         let decoder = ModuleDecoderRegistry::default().with_fallback();
-
-        let txid_bytes: Vec<u8> = row.try_get("txid")?;
-        let txid = TransactionId::consensus_decode_whole(&txid_bytes, &decoder)
-            .expect("Invalid data in DB");
-
-        let session_index = row.try_get::<_, i32>("session_index")?;
-
-        let item_index = row.try_get::<_, i32>("item_index")?;
-
         let data_bytes: Vec<u8> = row.try_get("data")?;
         let data =
             fedimint_core::transaction::Transaction::consensus_decode_whole(&data_bytes, &decoder)
                 .expect("Invalid data in DB");
 
-        Ok(crate::federation::db::Transaction {
-            txid,
-            session_index,
-            item_index,
-            data,
-        })
+        Ok(crate::federation::db::Transaction { data })
     }
 }
 

@@ -54,11 +54,11 @@ impl FederationObserver {
         federation_id: FederationId,
     ) -> anyhow::Result<Vec<SessionData>> {
         self.get_federation(federation_id)
-            .await
+            .await?
             .context("Federation doesn't exist")?;
 
         query::<SessionData>(&self.connection().await?, "
-            SELECT s.session_index, COUNT(t.txid) AS transaction_count
+            SELECT s.session_index::bigint AS session_index, COUNT(t.txid) AS transaction_count
             FROM sessions AS s
             LEFT JOIN transactions AS t ON s.federation_id = t.federation_id AND s.session_index = t.session_index
             WHERE s.federation_id = $1
@@ -79,5 +79,30 @@ impl FederationObserver {
                 &[&federation_id.consensus_encode_to_vec()]
             ).await?;
         Ok(session_count as u64)
+    }
+
+    /// The session to fetch next: one past the last stored session. Counting
+    /// rows instead would refetch a session forever if one were ever missing.
+    pub(crate) async fn next_session_index(
+        &self,
+        federation_id: FederationId,
+    ) -> anyhow::Result<u64> {
+        let connection = self.connection().await?;
+        let (next, count) = {
+            let row = connection
+                .query_one(
+                    "SELECT COALESCE(MAX(session_index) + 1, 0)::bigint, COUNT(*)::bigint FROM sessions WHERE federation_id = $1",
+                    &[&federation_id.consensus_encode_to_vec()],
+                )
+                .await?;
+            (row.get::<_, i64>(0), row.get::<_, i64>(1))
+        };
+        if next != count {
+            tracing::warn!(
+                "Federation {federation_id} is missing {} of its first {next} sessions; use the backfill endpoint after refetching them",
+                next - count
+            );
+        }
+        Ok(next as u64)
     }
 }

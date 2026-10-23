@@ -18,7 +18,7 @@ use axum::routing::{get, put};
 use axum::Router;
 use clap::Parser;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -116,6 +116,9 @@ async fn run(modules: ModuleRegistry) -> anyhow::Result<()> {
         "Observing modules {:?}",
         modules.kinds().collect::<Vec<_>>()
     );
+    if args.admin_auth.len() < 16 {
+        warn!("FO_ADMIN_AUTH is shorter than 16 characters; use a long random secret");
+    }
     info!("Starting API server on {}", args.bind);
 
     let app = Router::new()
@@ -126,17 +129,20 @@ async fn run(modules: ModuleRegistry) -> anyhow::Result<()> {
         .route("/nostr/federations", get(get_nostr_federations))
         .route("/nostr/federations", put(publish_federation_event))
         .layer(CorsLayer::permissive())
-        .with_state(AppState {
-            federation_config_cache: Default::default(),
-            meta_override_cache: Default::default(),
-            consensus_meta_cache: Default::default(),
-            federation_observer: FederationObserver::new(
+        .with_state({
+            let federation_observer = FederationObserver::new(
                 &args.database,
                 &args.admin_auth,
                 &args.mempool_url,
                 modules,
             )
-            .await?,
+            .await?;
+            AppState {
+                federation_config_cache: Default::default(),
+                meta_override_cache: Default::default(),
+                consensus_meta_cache: federation_observer.consensus_meta_cache().clone(),
+                federation_observer,
+            }
         });
 
     let listener = tokio::net::TcpListener::bind(&args.bind)

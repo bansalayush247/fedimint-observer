@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail, ensure, Context};
 use axum::extract::{Path, State};
 use axum::Json;
 use fedimint_api_client::api::DynGlobalApi;
+use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::{FederationId, JsonClientConfig};
 use fedimint_core::invite_code::InviteCode;
 use fedimint_meta_client::api::MetaFederationApi;
@@ -15,11 +16,18 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::meta::federation_meta;
+use crate::util::make_room;
 use crate::AppState;
 
 pub type MetaFields = BTreeMap<String, serde_json::Value>;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Override URLs and consensus metas come from federation configs anyone can
+/// make the observer download, so both caches are bounded
+const MAX_CACHED_METAS: usize = 256;
+/// Meta files are small JSON documents
+const MAX_META_OVERRIDE_BYTES: usize = 1024 * 1024;
+const CONSENSUS_META_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub async fn fetch_federation_meta(
     Path(invite): Path<InviteCode>,
@@ -27,16 +35,31 @@ pub async fn fetch_federation_meta(
 ) -> crate::error::Result<Json<MetaFields>> {
     let config = state
         .federation_config_cache
-        .fetch_config_cached(&invite, state.federation_observer.modules())
+        .fetch_config_cached(&invite, &state.federation_observer)
         .await?;
 
     federation_meta(&config, &state).await
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct MetaOverrideCache {
     client: reqwest::Client,
     override_files: Arc<tokio::sync::RwLock<HashMap<String, (serde_json::Value, SystemTime)>>>,
+}
+
+impl Default for MetaOverrideCache {
+    fn default() -> Self {
+        Self {
+            // The URL comes from a federation's config: bound how long a fetch
+            // can hang and how far it can be redirected
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::limited(3))
+                .build()
+                .expect("valid HTTP client configuration"),
+            override_files: Default::default(),
+        }
+    }
 }
 
 impl MetaOverrideCache {
@@ -58,6 +81,9 @@ impl MetaOverrideCache {
             _ => {
                 let meta = self.fetch_meta_inner(url).await?;
                 let mut cache = self.override_files.write().await;
+                if !cache.contains_key(url) {
+                    make_room(&mut cache, MAX_CACHED_METAS);
+                }
                 cache.insert(url.to_owned(), (meta.clone(), SystemTime::now()));
                 meta
             }
@@ -72,13 +98,16 @@ impl MetaOverrideCache {
     }
 
     async fn fetch_meta_inner(&self, url: &str) -> anyhow::Result<serde_json::Value> {
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?)
+        let mut response = self.client.get(url).send().await?.error_for_status()?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            body.extend_from_slice(&chunk);
+            ensure!(
+                body.len() <= MAX_META_OVERRIDE_BYTES,
+                "Meta override file is larger than {MAX_META_OVERRIDE_BYTES} bytes"
+            );
+        }
+        Ok(serde_json::from_slice(&body)?)
     }
 }
 
@@ -90,7 +119,11 @@ pub struct ConsensusMetaCache {
 }
 
 impl ConsensusMetaCache {
-    pub async fn fetch_meta_cached(&self, config: &JsonClientConfig) -> Option<MetaFields> {
+    pub async fn fetch_meta_cached(
+        &self,
+        config: &JsonClientConfig,
+        connectors: &ConnectorRegistry,
+    ) -> Option<MetaFields> {
         let federation_id = config.global.calculate_federation_id();
         let current_meta_cache_entry = {
             let metas = self.metas.read().await;
@@ -104,10 +137,11 @@ impl ConsensusMetaCache {
                     {
                         let mut metas = self.metas.write().await;
 
-                        // Check if another process has already started a background refresh
-                        if now.duration_since(last_update_started).unwrap_or_default()
-                            <= REFRESH_INTERVAL
-                        {
+                        // Another request may have started a refresh since we
+                        // read the entry
+                        if metas.get(&federation_id).is_some_and(|(_, started)| {
+                            now.duration_since(*started).unwrap_or_default() <= REFRESH_INTERVAL
+                        }) {
                             return meta;
                         }
 
@@ -121,15 +155,16 @@ impl ConsensusMetaCache {
 
                     let self_inner = self.metas.clone();
                     let config_inner = config.clone();
+                    let connectors = connectors.clone();
                     tokio::task::spawn(async move {
-                        Self::update_meta_cache(&self_inner, &config_inner).await;
+                        Self::update_meta_cache(&self_inner, &config_inner, &connectors).await;
                     });
                 }
                 meta
             }
             None => {
                 // TODO: deduplicate efforts by making the content of the map subscribable
-                Self::update_meta_cache(&self.metas, config).await
+                Self::update_meta_cache(&self.metas, config, connectors).await
             }
         }
     }
@@ -137,21 +172,32 @@ impl ConsensusMetaCache {
     pub async fn update_meta_cache(
         inner: &ConsensusMetaCacheInner,
         config: &JsonClientConfig,
+        connectors: &ConnectorRegistry,
     ) -> Option<MetaFields> {
         let federation_id = config.global.calculate_federation_id();
-        let meta = Self::try_fetch_meta_inner(config)
-            .await
-            .map_err(|e| {
-                warn!("Failed to fetch consensus meta for federation {federation_id}: {e}");
-            })
-            .ok()
-            .flatten();
+        let meta = tokio::time::timeout(
+            CONSENSUS_META_TIMEOUT,
+            Self::try_fetch_meta_inner(config, connectors),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("timed out")))
+        .map_err(|e| {
+            warn!("Failed to fetch consensus meta for federation {federation_id}: {e}");
+        })
+        .ok()
+        .flatten();
         let mut metas = inner.write().await;
+        if !metas.contains_key(&federation_id) {
+            make_room(&mut metas, MAX_CACHED_METAS);
+        }
         metas.insert(federation_id, (meta.clone(), SystemTime::now()));
         meta
     }
 
-    async fn try_fetch_meta_inner(config: &JsonClientConfig) -> anyhow::Result<Option<MetaFields>> {
+    async fn try_fetch_meta_inner(
+        config: &JsonClientConfig,
+        connectors: &ConnectorRegistry,
+    ) -> anyhow::Result<Option<MetaFields>> {
         let Some((meta_instance_id, _)) = config
             .modules
             .iter()
@@ -160,16 +206,15 @@ impl ConsensusMetaCache {
             bail!("No meta module found in federation");
         };
 
-        let connectors = fedimint_connectors::ConnectorRegistry::build_from_client_env()?
-            .bind()
-            .await?;
+        // Reuse the observer's registry: one built per refresh keeps its
+        // guardian connections open
         let peers = config
             .global
             .api_endpoints
             .iter()
             .map(|(peer_id, peer)| (*peer_id, peer.url.clone()))
             .collect();
-        let api_client = DynGlobalApi::new(connectors, peers, None)?;
+        let api_client = DynGlobalApi::new(connectors.clone(), peers, None)?;
 
         let module_api = api_client.with_module(*meta_instance_id);
 

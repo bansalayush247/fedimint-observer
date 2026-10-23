@@ -48,7 +48,17 @@ impl FederationObserver {
         }
     }
 
+    /// The relay pool shared by the sync task and the publish endpoints,
+    /// connected on first use. A pool keeps reconnecting to its relays until
+    /// it is shut down, so one per request leaked ten connections each time.
     async fn nostr_relay_client(&self) -> anyhow::Result<RelayPool> {
+        self.nostr_pool()
+            .get_or_try_init(|| self.connect_nostr_relays())
+            .await
+            .cloned()
+    }
+
+    async fn connect_nostr_relays(&self) -> anyhow::Result<RelayPool> {
         let relays = query::<NostrRelay>(
             &self.connection().await?,
             "SELECT relay_url FROM nostr_relays",
@@ -111,11 +121,18 @@ impl FederationObserver {
                 federation_id
             );
             let mut conn = self.connection().await?;
-            let dbtx = conn.transaction().await?;
+            let mut dbtx = conn.transaction().await?;
             for event in events {
                 let event_id = event.id;
-                if let Err(e) = insert_federation_votes(&dbtx, event).await {
-                    warn!(%e, "Failed to insert federation vote {}", event_id);
+                // A failed statement aborts the whole transaction, so each
+                // event gets a savepoint to fail alone
+                let savepoint = dbtx.savepoint("nostr_vote").await?;
+                match insert_federation_votes(&savepoint, event).await {
+                    Ok(()) => savepoint.commit().await?,
+                    Err(e) => {
+                        warn!(%e, "Failed to insert federation vote {}", event_id);
+                        savepoint.rollback().await?;
+                    }
                 }
             }
             dbtx.commit().await?;
@@ -130,11 +147,16 @@ impl FederationObserver {
         debug!("Fetched {} federation announcements", events.len());
 
         let mut conn = self.connection().await?;
-        let dbtx = conn.transaction().await?;
+        let mut dbtx = conn.transaction().await?;
         for event in events {
             let event_id = event.id;
-            if let Err(e) = insert_federation(&dbtx, event).await {
-                warn!(%e, "Failed to insert federation announcement {}", event_id);
+            let savepoint = dbtx.savepoint("nostr_announcement").await?;
+            match insert_federation(&savepoint, event).await {
+                Ok(()) => savepoint.commit().await?,
+                Err(e) => {
+                    warn!(%e, "Failed to insert federation announcement {}", event_id);
+                    savepoint.rollback().await?;
+                }
             }
         }
         dbtx.commit().await?;
@@ -259,6 +281,9 @@ impl TryFrom<Event> for ParsedFederationEvent {
             event.kind == FEDERATION_ANNOUNCEMENT_EVENT_KIND,
             "Not a federation invite event"
         );
+        // Deserializing an event doesn't check it, so unverified events
+        // could be stored and relayed in anyone's name
+        event.verify().context("Invalid Nostr event signature")?;
 
         let event_id = event.id.to_bytes();
 
@@ -317,6 +342,7 @@ impl TryFrom<Event> for ParsedRecommendationEvent {
             event.kind == RECOMMENDATION_EVENT_KIND,
             "Not a federation recommendation"
         );
+        event.verify().context("Invalid Nostr event signature")?;
 
         // TODO: make constant
         let federation_tag = SingleLetterTag::from_char('d').expect("Tag is valid");
@@ -478,4 +504,35 @@ pub(crate) async fn publish_federation_event(
     Json(event): Json<nostr_sdk::Event>,
 ) -> crate::error::Result<()> {
     Ok(state.federation_observer.submit_federation(event).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::config::FederationId;
+    use nostr_sdk::{EventBuilder, Keys, Tag};
+
+    use super::{ParsedRecommendationEvent, RECOMMENDATION_EVENT_KIND};
+
+    #[test]
+    fn only_correctly_signed_ratings_are_accepted() {
+        let federation_id = FederationId::dummy();
+        let event = EventBuilder::new(
+            RECOMMENDATION_EVENT_KIND,
+            "[5/5] great",
+            [Tag::identifier(federation_id.to_string())],
+        )
+        .to_event(&Keys::generate())
+        .unwrap();
+
+        let parsed = ParsedRecommendationEvent::try_from(event.clone()).unwrap();
+        assert_eq!(parsed.federation_id, federation_id);
+        assert_eq!(parsed.star_vote, Some(5));
+
+        // What a PUT body can carry: the signed event with its content edited.
+        // Deserializing it succeeds, so the signature check must catch it.
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["content"] = "[1/5] terrible".into();
+        let forged: nostr_sdk::Event = serde_json::from_value(json).unwrap();
+        assert!(ParsedRecommendationEvent::try_from(forged).is_err());
+    }
 }

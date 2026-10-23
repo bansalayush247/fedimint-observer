@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::Context;
 use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -16,8 +18,8 @@ use crate::config::meta::fetch_federation_meta;
 use crate::config::modules::fetch_federation_module_kinds;
 use crate::error::Result;
 use crate::federation::gateways::fetch_gateways_for_config;
-use crate::module::ModuleRegistry;
-use crate::util::config_to_json;
+use crate::federation::observer::FederationObserver;
+use crate::util::{config_to_json, make_room};
 use crate::AppState;
 
 /// Helper API that exposes the federation id
@@ -55,7 +57,7 @@ pub async fn fetch_federation_config(
 ) -> Result<Json<JsonClientConfig>> {
     Ok(state
         .federation_config_cache
-        .fetch_config_cached(&invite, state.federation_observer.modules())
+        .fetch_config_cached(&invite, &state.federation_observer)
         .await?
         .into())
 }
@@ -82,7 +84,7 @@ impl FederationConfigCache {
     pub async fn fetch_config_cached(
         &self,
         invite: &InviteCode,
-        modules: &ModuleRegistry,
+        observer: &FederationObserver,
     ) -> anyhow::Result<JsonClientConfig> {
         let federation_id = invite.federation_id();
 
@@ -90,8 +92,11 @@ impl FederationConfigCache {
             return Ok(config);
         }
 
-        let config = fetch_config_inner(invite, modules).await?;
+        let config = fetch_config_inner(invite, observer).await?;
         let mut cache = self.federations.write().await;
+        if !cache.contains_key(&federation_id) {
+            make_room(&mut cache, MAX_CACHED_CONFIGS);
+        }
         if let Some(replaced) = cache.insert(federation_id, config.clone()) {
             if replaced != config {
                 // TODO: use tracing
@@ -103,14 +108,23 @@ impl FederationConfigCache {
     }
 }
 
+/// Federations anyone can ask about through an invite code
+const MAX_CACHED_CONFIGS: usize = 256;
+/// The invite code names the servers to contact, so it can name unreachable
+/// ones; the client retries each of them
+const CONFIG_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
 async fn fetch_config_inner(
     invite: &InviteCode,
-    modules: &ModuleRegistry,
+    observer: &FederationObserver,
 ) -> anyhow::Result<JsonClientConfig> {
-    let connectors = fedimint_connectors::ConnectorRegistry::build_from_client_env()?
-        .bind()
-        .await?;
-    let (raw_config, _api) =
-        fedimint_api_client::download_from_invite_code(&connectors, invite).await?;
-    config_to_json(raw_config, modules)
+    // Reuse the observer's registry: a registry built per request keeps its
+    // guardian connections open after the request ends
+    let (raw_config, _api) = tokio::time::timeout(
+        CONFIG_FETCH_TIMEOUT,
+        fedimint_api_client::download_from_invite_code(observer.connectors(), invite),
+    )
+    .await
+    .context("Timed out downloading the federation config")??;
+    config_to_json(raw_config, observer.modules())
 }

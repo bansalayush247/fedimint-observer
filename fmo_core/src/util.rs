@@ -8,6 +8,19 @@ use serde_json::json;
 use crate::config::meta::MetaFields;
 use crate::module::ModuleRegistry;
 
+/// Caches keyed by what callers send (invite codes, meta URLs) must stay
+/// bounded: makes room for one more entry by evicting an arbitrary one
+pub fn make_room<K, V>(map: &mut std::collections::HashMap<K, V>, max_entries: usize)
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    if map.len() >= max_entries {
+        if let Some(key) = map.keys().next().cloned() {
+            map.remove(&key);
+        }
+    }
+}
+
 pub fn config_to_json(
     cfg: ClientConfig,
     modules: &ModuleRegistry,
