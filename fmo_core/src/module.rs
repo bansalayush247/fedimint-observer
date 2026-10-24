@@ -2,19 +2,25 @@
 //! of modules an observer build includes.
 //!
 //! Core fetches sessions and writes the module-agnostic rows (`transactions`,
-//! `transaction_inputs`/`_outputs`, their `_details` and `consensus_items`).
-//! For every item it first asks the owning module for a summary (amount and
-//! JSON details), writes its own row from it, and then lets the module write
-//! its own tables. Items of modules this build doesn't include are stored with
-//! their kind and no amount or details. Adding the module to a build later
-//! doesn't fill those in yet: core rows are written once (`ON CONFLICT DO
-//! NOTHING`), so that needs the replay of a later step of issue #8.
+//! `transaction_inputs`/`_outputs`, their `_details` and `consensus_items`),
+//! asking the owning module for a summary of every item (amount and JSON
+//! details). Items of modules this build doesn't include are stored with their
+//! kind and no amount or details.
+//!
+//! A module's own tables are derived from the stored sessions afterwards, by
+//! the module's projector (`federation/projector.rs`): one per module and
+//! federation, it runs the module's `process_*` on the items of its kind,
+//! batches of sessions at a time, each batch in one transaction with the move
+//! of the module's cursor in `module_cursors`. A module added to a build later
+//! starts at session 0 and also completes the core rows of its items from its
+//! summaries, a module's bug is fixed by resetting its cursor, and a module
+//! that fails holds back only itself. Rows a module writes may lag a moment
+//! behind the core rows of the same session.
 //!
 //! A module's tables live in its own schema, `fmo_<kind>` (see
 //! [`schema_name`]), created by core at startup. Core's tables stay in
-//! `public`. Module SQL names its tables schema-qualified, since one session
-//! transaction runs every module; only the module's own migrations run with
-//! its schema first on the search path.
+//! `public`. Module SQL names its tables schema-qualified; only the module's
+//! own migrations run with its schema first on the search path.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -28,7 +34,6 @@ use fedimint_core::config::{ClientConfig, FederationId, JsonClientConfig};
 use fedimint_core::core::{
     Decoder, DynInput, DynModuleConsensusItem, DynOutput, ModuleInstanceId, ModuleKind,
 };
-use fedimint_core::encoding::Encodable;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::{PeerId, TransactionId};
@@ -89,33 +94,13 @@ pub struct OutputSummary {
     pub details: Option<serde_json::Value>,
 }
 
-/// Access a module gets while processing one session
+/// Access a module gets while processing a batch of sessions
 pub struct ProcessCtx<'a> {
+    /// The batch's transaction, committed with the move of the module's cursor
     pub dbtx: &'a DbTransaction<'a>,
     pub config: &'a ClientConfig,
     /// Client of the configured mempool instance
     pub esplora: &'a esplora_client::AsyncClient,
-}
-
-impl ProcessCtx<'_> {
-    /// Records a guardian's vote on the current block height in `ci`, which
-    /// dates the session. The votes are core's: `session_times` is built from
-    /// them.
-    pub async fn record_block_height_vote(&self, meta: &CiMeta, height: u32) -> anyhow::Result<()> {
-        self.dbtx
-            .execute(
-                "INSERT INTO block_height_votes VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-                &[
-                    &meta.federation_id.consensus_encode_to_vec(),
-                    &(meta.session_index as i32),
-                    &(meta.item_index as i32),
-                    &(meta.peer.to_usize() as i32),
-                    &(height as i32),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
 }
 
 /// What core offers a module's endpoints and background tasks
@@ -188,11 +173,12 @@ pub fn schema_name(kind: &str) -> anyhow::Result<String> {
 
 /// A Fedimint module the observer can decode and process.
 ///
-/// `summarize_*` must not do I/O: core calls them before writing its own row.
-/// Return errors rather than panicking: an error stalls only this federation,
-/// which retries the session 30 s later.
-/// `process_*` run afterwards in the same database transaction, so a module's
-/// tables may reference the core rows of the item.
+/// `summarize_*` and `block_height_vote` must not do I/O: core calls them
+/// while storing a session, before writing its own rows. `process_*` run in
+/// the module's projector, after the session and its core rows are committed,
+/// so a module's tables may reference the core rows of the item. Return errors
+/// rather than panicking: an error stalls only this module's projector for
+/// this federation, which retries the batch 30 s later.
 #[async_trait]
 pub trait ObserverModule: Send + Sync + 'static {
     /// The module kind as it appears in client configs, e.g. `wallet`
@@ -252,6 +238,25 @@ pub trait ObserverModule: Send + Sync + 'static {
 
     /// JSON stored in `consensus_items`, or `None` to store nothing
     fn summarize_ci(&self, ci: &DynModuleConsensusItem) -> Option<serde_json::Value>;
+
+    /// The block height this consensus item votes for, if it is a vote. The
+    /// votes date the session, so core records them in `block_height_votes`
+    /// while storing it: `session_times`, a core read model, is built from
+    /// them.
+    fn block_height_vote(&self, _ci: &DynModuleConsensusItem) -> Option<u32> {
+        None
+    }
+
+    /// Deletes everything the module derived from the federation's sessions,
+    /// before a clean replay from session 0 rebuilds it. Tables the module's
+    /// tasks keep, which no session feeds, stay.
+    async fn reset_federation(
+        &self,
+        _ctx: &ProcessCtx<'_>,
+        _federation_id: FederationId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn process_input(
         &self,

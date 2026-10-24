@@ -5,6 +5,7 @@ import { api } from '../services/api';
 import { publishNostrEvent } from '../services/nostr';
 import type {
   FederationHistogram,
+  FederationOverview,
   FederationSummary,
   GuardianClaimedUtxoState,
   GuardianHealth,
@@ -76,6 +77,7 @@ export function FederationDetail() {
   // UTXOs load the first time their tab opens, and are only ever shown there
   const [utxosRequested, setUtxosRequested] = useState(false);
   const [utxosLoading, setUtxosLoading] = useState(true);
+  const [overview, setOverview] = useState<FederationOverview | null>(null);
   const [utxoView, setUtxoView] = useState<UtxoView>('all');
   const [utxoPage, setUtxoPage] = useState(1);
   const [utxoSearch, setUtxoSearch] = useState('');
@@ -263,8 +265,20 @@ export function FederationDetail() {
         if (!signal.aborted) setUtxosLoading(false);
       });
 
+    // How far the wallet module has indexed the stored sessions
+    api.getFederationOverview(id, signal)
+      .then((data) => {
+        if (!signal.aborted) setOverview(data);
+      })
+      .catch((err) => {
+        if (!signal.aborted) console.error('Failed to fetch federation overview:', err);
+      });
+
     return () => controller.abort();
   }, [id, utxosRequested]);
+
+  const walletSessions = overview?.module_sessions.wallet;
+  const walletBehind = overview != null && walletSessions != null && walletSessions < overview.session_count;
 
   // Update zoom state when histogram data loads
   useEffect(() => {
@@ -774,6 +788,12 @@ export function FederationDetail() {
                 {guardianFindings.length > 0 && (
                   <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200 sm:px-6">
                     {guardianFindings.join(' ')}
+                  </div>
+                )}
+
+                {walletBehind && (
+                  <div className="border-b border-gray-200 px-4 py-3 text-xs text-gray-600 dark:border-gray-700 dark:text-gray-300 sm:px-6">
+                    The observer's wallet history is indexed to session {walletSessions} of {overview.session_count}, so outputs from later sessions are not listed yet.
                   </div>
                 )}
 

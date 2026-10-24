@@ -92,6 +92,21 @@ impl ObserverModule for LnObserver {
         details_json::<LightningConsensusItem>(ci.as_any(), ci, "Lightning CI")
     }
 
+    /// Contracts come from sessions; the gateway registry is the task's
+    async fn reset_federation(
+        &self,
+        ctx: &ProcessCtx<'_>,
+        federation_id: FederationId,
+    ) -> anyhow::Result<()> {
+        ctx.dbtx
+            .execute(
+                "DELETE FROM fmo_ln.contracts WHERE federation_id = $1",
+                &[&federation_id.consensus_encode_to_vec()],
+            )
+            .await?;
+        Ok(())
+    }
+
     fn federation_routes(&self) -> Option<Router<Services>> {
         Some(gateways::federation_routes(self.overviews.clone()))
     }

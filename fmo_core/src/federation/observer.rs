@@ -17,7 +17,7 @@ use fedimint_core::session_outcome::SessionOutcome;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::util::backoff_util::background_backoff;
 use fedimint_core::util::retry;
-use fedimint_core::{Amount, PeerId};
+use fedimint_core::{Amount, PeerId, TransactionId};
 use fedimint_wallet_common::WalletInput;
 use fmo_api_types::{
     FederationActivity, FederationHealth, FederationRating, FederationSummary, FedimintTotals,
@@ -34,11 +34,9 @@ use crate::config::meta::{ConsensusMetaCache, MetaFieldsExt};
 use crate::config::FederationConfigCache;
 use crate::db::{migration, migration_backfill, schema_setup, DbMigration};
 use crate::federation::db::Federation;
+use crate::federation::projector::ProjectorWakeups;
 use crate::federation::{db, instance_to_kind};
-use crate::module::{
-    schema_name, CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx,
-    Services,
-};
+use crate::module::{schema_name, InputSummary, ModuleRegistry, OutputSummary, Services};
 use crate::task::supervise;
 use crate::util::{federation_api, query, query_one, query_opt, query_value};
 
@@ -65,6 +63,9 @@ pub struct FederationObserver {
     /// Configs fetched by invite code, shared with the config API
     federation_config_cache: FederationConfigCache,
     modules: ModuleRegistry,
+    /// Tells a federation's module projectors about stored sessions and moved
+    /// cursors
+    projector_wakeups: ProjectorWakeups,
     nostr_pool: Arc<tokio::sync::OnceCell<nostr_sdk::RelayPool>>,
 }
 
@@ -107,6 +108,7 @@ impl FederationObserver {
             connectors,
             federation_config_cache: Default::default(),
             modules,
+            projector_wakeups: Default::default(),
             nostr_pool: Default::default(),
         };
 
@@ -175,6 +177,14 @@ impl FederationObserver {
         &self.esplora
     }
 
+    pub(super) fn task_group(&self) -> &TaskGroup {
+        &self.task_group
+    }
+
+    pub(super) fn projector_wakeups(&self) -> &ProjectorWakeups {
+        &self.projector_wakeups
+    }
+
     fn spawn_observer(&self, federation: Federation) {
         let slf = self.clone();
 
@@ -203,6 +213,7 @@ impl FederationObserver {
             .instrument(info_span!("health", fed = %federation_id.to_prefix())),
         );
 
+        self.spawn_projectors(&federation);
         self.spawn_module_federation_tasks(federation);
     }
 
@@ -908,6 +919,7 @@ impl FederationObserver {
                 .await?;
             }
             dbtx.commit().await?;
+            self.projector_wakeups.wake(federation_id);
             gate.stored(session_index);
             progress.record(session_index);
         }
@@ -981,11 +993,6 @@ impl FederationObserver {
         transaction: fedimint_core::transaction::Transaction,
     ) -> anyhow::Result<()> {
         let fedimint_txid = transaction.tx_hash();
-        let ctx = ProcessCtx {
-            dbtx,
-            config,
-            esplora: &self.esplora,
-        };
 
         dbtx.execute(
             "INSERT INTO transactions VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
@@ -1001,10 +1008,12 @@ impl FederationObserver {
 
         for (in_idx, input) in transaction.inputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, input.module_instance_id());
-            let module = self.modules.get(&kind);
-            let summary = match module {
+            let summary = match self.modules.get(&kind) {
                 Some(module) => module.summarize_input(&input)?,
-                None => InputSummary::default(),
+                None => {
+                    warn!("Transaction Input of kind {kind}. Not implemented.");
+                    InputSummary::default()
+                }
             };
 
             dbtx.execute(
@@ -1020,40 +1029,20 @@ impl FederationObserver {
             )
             .await?;
 
-            let meta = ItemMeta {
-                federation_id,
-                module_instance_id: input.module_instance_id(),
-                txid: fedimint_txid,
-                session_index,
-                item_index,
-                index: in_idx as u64,
-            };
-            match module {
-                Some(module) => module.process_input(&ctx, &meta, &input, &summary).await?,
-                None => warn!("Transaction Input of kind {kind}. Not implemented."),
-            }
-
-            if let Some(json_value) = &summary.details {
-                dbtx.execute(
-                    "INSERT INTO transaction_input_details VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-                    &[
-                        &federation_id.consensus_encode_to_vec(),
-                        &fedimint_txid.consensus_encode_to_vec(),
-                        &(in_idx as i32),
-                        &kind,
-                        json_value,
-                    ],
-                )
-                .await?;
+            if let Some(details) = &summary.details {
+                insert_input_details(dbtx, federation_id, fedimint_txid, in_idx, &kind, details)
+                    .await?;
             }
         }
 
         for (out_idx, output) in transaction.outputs.into_iter().enumerate() {
             let kind = instance_to_kind(config, output.module_instance_id());
-            let module = self.modules.get(&kind);
-            let summary = match module {
+            let summary = match self.modules.get(&kind) {
                 Some(module) => module.summarize_output(&output)?,
-                None => OutputSummary::default(),
+                None => {
+                    warn!("Transaction Output of kind {kind}. Not implemented.");
+                    OutputSummary::default()
+                }
             };
 
             dbtx.execute(
@@ -1070,35 +1059,9 @@ impl FederationObserver {
             )
             .await?;
 
-            let meta = ItemMeta {
-                federation_id,
-                module_instance_id: output.module_instance_id(),
-                txid: fedimint_txid,
-                session_index,
-                item_index,
-                index: out_idx as u64,
-            };
-            match module {
-                Some(module) => {
-                    module
-                        .process_output(&ctx, &meta, &output, &summary)
-                        .await?
-                }
-                None => warn!("Transaction Output of kind {kind}. Not implemented."),
-            }
-
-            if let Some(json_value) = &summary.details {
-                dbtx.execute(
-                    "INSERT INTO transaction_output_details VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-                    &[
-                        &federation_id.consensus_encode_to_vec(),
-                        &fedimint_txid.consensus_encode_to_vec(),
-                        &(out_idx as i32),
-                        &kind,
-                        json_value,
-                    ],
-                )
-                .await?;
+            if let Some(details) = &summary.details {
+                insert_output_details(dbtx, federation_id, fedimint_txid, out_idx, &kind, details)
+                    .await?;
             }
         }
 
@@ -1122,34 +1085,23 @@ impl FederationObserver {
             return Ok(());
         };
 
-        if let Some(json_value) = module.summarize_ci(&ci) {
-            dbtx.execute(
-                "INSERT INTO consensus_items VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
-                &[
-                    &federation_id.consensus_encode_to_vec(),
-                    &(session_index as i32),
-                    &(item_index as i32),
-                    &(peer_id.to_usize() as i32),
-                    &kind,
-                    &json_value,
-                ],
-            )
-            .await?;
-        }
-
-        let ctx = ProcessCtx {
-            dbtx,
-            config,
-            esplora: &self.esplora,
-        };
-        let meta = CiMeta {
+        let at = CiPosition {
             federation_id,
-            module_instance_id: ci.module_instance_id(),
             session_index,
             item_index,
             peer: peer_id,
         };
-        module.process_ci(&ctx, &meta, &ci).await
+        if let Some(data) = module.summarize_ci(&ci) {
+            insert_consensus_item(dbtx, &at, &kind, &data).await?;
+        }
+
+        // Votes date the session: session_times, a core read model, is built
+        // from them in this transaction (record_new_session)
+        if let Some(height) = module.block_height_vote(&ci) {
+            insert_block_height_vote(dbtx, &at, height).await?;
+        }
+
+        Ok(())
     }
 
     async fn refresh_views(self) {
@@ -1236,9 +1188,10 @@ impl FederationObserver {
         })
     }
 
-    /// Reprocesses stored sessions of a federation, filling in rows that are
-    /// missing. Commits every `BACKFILL_BATCH` sessions, so an interrupted run
-    /// keeps its progress.
+    /// Reprocesses stored sessions of a federation, filling in core rows that
+    /// are missing. Commits every `BACKFILL_BATCH` sessions, so an interrupted
+    /// run keeps its progress. Module tables are rebuilt by resetting the
+    /// module's cursor instead (`reset_module_cursor`).
     pub async fn backfill_federation(
         &self,
         federation_id: FederationId,
@@ -1376,14 +1329,14 @@ impl SessionFetchGate {
 }
 
 /// Logs how far a sync got and how fast, at most every 5 s
-struct SyncProgress {
+pub(super) struct SyncProgress {
     unit: &'static str,
     logged_at: Instant,
     logged_position: u64,
 }
 
 impl SyncProgress {
-    fn new(unit: &'static str, position: u64) -> Self {
+    pub(super) fn new(unit: &'static str, position: u64) -> Self {
         SyncProgress {
             unit,
             logged_at: Instant::now(),
@@ -1391,7 +1344,7 @@ impl SyncProgress {
         }
     }
 
-    fn record(&mut self, position: u64) {
+    pub(super) fn record(&mut self, position: u64) {
         let elapsed = self.logged_at.elapsed();
         if elapsed < Duration::from_secs(5) {
             return;
@@ -1403,6 +1356,102 @@ impl SyncProgress {
         self.logged_at = Instant::now();
         self.logged_position = position;
     }
+}
+
+// Core rows written from a module's summary of an item. Ingest writes them as
+// it stores a session; the module's projector writes the ones of items stored
+// while the build lacked the module (projector.rs).
+
+pub(super) async fn insert_input_details(
+    dbtx: &Transaction<'_>,
+    federation_id: FederationId,
+    txid: TransactionId,
+    in_index: usize,
+    kind: &str,
+    details: &serde_json::Value,
+) -> anyhow::Result<()> {
+    dbtx.execute(
+        "INSERT INTO transaction_input_details VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        &[
+            &federation_id.consensus_encode_to_vec(),
+            &txid.consensus_encode_to_vec(),
+            &(in_index as i32),
+            &kind,
+            details,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn insert_output_details(
+    dbtx: &Transaction<'_>,
+    federation_id: FederationId,
+    txid: TransactionId,
+    out_index: usize,
+    kind: &str,
+    details: &serde_json::Value,
+) -> anyhow::Result<()> {
+    dbtx.execute(
+        "INSERT INTO transaction_output_details VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        &[
+            &federation_id.consensus_encode_to_vec(),
+            &txid.consensus_encode_to_vec(),
+            &(out_index as i32),
+            &kind,
+            details,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Where a module consensus item sits in a federation's history
+pub(super) struct CiPosition {
+    pub(super) federation_id: FederationId,
+    pub(super) session_index: u64,
+    pub(super) item_index: u64,
+    pub(super) peer: PeerId,
+}
+
+pub(super) async fn insert_consensus_item(
+    dbtx: &Transaction<'_>,
+    at: &CiPosition,
+    kind: &str,
+    data: &serde_json::Value,
+) -> anyhow::Result<()> {
+    dbtx.execute(
+        "INSERT INTO consensus_items VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        &[
+            &at.federation_id.consensus_encode_to_vec(),
+            &(at.session_index as i32),
+            &(at.item_index as i32),
+            &(at.peer.to_usize() as i32),
+            &kind,
+            data,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn insert_block_height_vote(
+    dbtx: &Transaction<'_>,
+    at: &CiPosition,
+    height: u32,
+) -> anyhow::Result<()> {
+    dbtx.execute(
+        "INSERT INTO block_height_votes VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        &[
+            &at.federation_id.consensus_encode_to_vec(),
+            &(at.session_index as i32),
+            &(at.item_index as i32),
+            &(at.peer.to_usize() as i32),
+            &(height as i32),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) fn federation_id_from_db(bytes: &[u8]) -> anyhow::Result<FederationId> {

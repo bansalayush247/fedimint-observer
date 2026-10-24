@@ -3,6 +3,7 @@ mod guardians;
 mod meta;
 pub(crate) mod nostr;
 pub mod observer;
+mod projector;
 mod session;
 mod transaction;
 
@@ -14,9 +15,8 @@ use axum_auth::AuthBearer;
 use fedimint_core::config::{ClientConfig, FederationId, JsonClientConfig};
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::invite_code::InviteCode;
-use fmo_api_types::{FederationSummary, FedimintTotals};
+use fmo_api_types::{FederationOverview, FederationSummary, FedimintTotals};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::federation::guardians::get_federation_health;
 use crate::federation::meta::get_federation_meta;
@@ -58,6 +58,10 @@ pub fn get_federations_routes() -> Router<AppState> {
         .route("/:federation_id/sessions", get(list_sessions))
         .route("/:federation_id/sessions/count", get(count_sessions))
         .route("/:federation_id/backfill", post(backfill_federation))
+        .route(
+            "/:federation_id/modules/:kind/reset",
+            post(reset_module_cursor),
+        )
 }
 
 pub async fn list_observed_federations(
@@ -117,20 +121,13 @@ pub(crate) async fn observed_config_json(
 async fn get_federation_overview(
     Path(federation_id): Path<FederationId>,
     State(state): State<AppState>,
-) -> crate::error::Result<Json<serde_json::Value>> {
-    let session_count = state
-        .federation_observer
-        .federation_session_count(federation_id)
-        .await?;
-    let total_assets_msat = state
-        .federation_observer
-        .get_federation_assets(federation_id)
-        .await?;
-
-    Ok(json!({
-        "session_count": session_count,
-        "total_assets_msat": total_assets_msat
-    })
+) -> crate::error::Result<Json<FederationOverview>> {
+    let observer = &state.federation_observer;
+    Ok(FederationOverview {
+        session_count: observer.federation_session_count(federation_id).await?,
+        total_assets_msat: observer.get_federation_assets(federation_id).await?,
+        module_sessions: observer.module_positions(federation_id).await?,
+    }
     .into())
 }
 
@@ -164,6 +161,33 @@ async fn backfill_federation(
     Ok(state
         .federation_observer
         .backfill_federation(federation_id, params.session_start, params.session_end)
+        .await?)
+}
+
+#[derive(Deserialize, Debug)]
+struct ResetModuleParams {
+    /// The session the module processes next; 0 replays everything
+    #[serde(default)]
+    session_start: u64,
+    /// Delete what the module derived from the federation first, so the replay
+    /// rebuilds it; only from session 0
+    #[serde(default)]
+    clean: bool,
+}
+
+/// Admin: makes a module process a federation's stored sessions again from
+/// `session_start`, by moving its cursor
+async fn reset_module_cursor(
+    Path((federation_id, kind)): Path<(FederationId, String)>,
+    AuthBearer(auth): AuthBearer,
+    State(state): State<AppState>,
+    Json(params): Json<ResetModuleParams>,
+) -> crate::error::Result<()> {
+    state.federation_observer.check_auth(&auth)?;
+
+    Ok(state
+        .federation_observer
+        .reset_module_cursor(federation_id, &kind, params.session_start, params.clean)
         .await?)
 }
 
