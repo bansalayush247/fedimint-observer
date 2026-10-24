@@ -317,6 +317,9 @@ ALTER MATERIALIZED VIEW utxos SET SCHEMA fmo_wallet;
 CREATE SCHEMA fmo_ln;
 ALTER TABLE ln_contracts SET SCHEMA fmo_ln;
 ALTER TABLE fmo_ln.ln_contracts RENAME TO contracts;
+-- The gateway registry and its polls, kept by the Lightning module's task
+ALTER TABLE gateways SET SCHEMA fmo_ln;
+ALTER TABLE gateway_poll_snapshots SET SCHEMA fmo_ln;
 
 -- block_height_votes stays in public: the wallet module records the votes,
 -- but session_times, a core read model, is built from them.

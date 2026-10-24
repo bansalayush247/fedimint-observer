@@ -17,16 +17,28 @@
 //! its schema first on the search path.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fedimint_core::config::{ClientConfig, FederationId};
+use axum::Router;
+use fedimint_connectors::ConnectorRegistry;
+use fedimint_core::config::{ClientConfig, FederationId, JsonClientConfig};
 use fedimint_core::core::{
     Decoder, DynInput, DynModuleConsensusItem, DynOutput, ModuleInstanceId, ModuleKind,
 };
 use fedimint_core::encoding::Encodable;
+use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::{PeerId, TransactionId};
+
+pub use crate::error::{AppError as ApiError, Result as ApiResult};
+pub use crate::federation::db::Federation;
+use crate::federation::observer::FederationObserver;
+pub use crate::util::{
+    federation_api, module_instance_id, query, query_one, query_opt, query_value,
+};
 
 /// The database transaction a session is processed in
 pub type DbTransaction<'a> = deadpool_postgres::Transaction<'a>;
@@ -106,6 +118,62 @@ impl ProcessCtx<'_> {
     }
 }
 
+/// What core offers a module's endpoints and background tasks
+#[derive(Clone)]
+pub struct Services(FederationObserver);
+
+impl Services {
+    pub(crate) fn new(observer: FederationObserver) -> Self {
+        Self(observer)
+    }
+
+    /// A pooled database connection
+    pub async fn connection(&self) -> anyhow::Result<deadpool_postgres::Object> {
+        self.0.connection().await
+    }
+
+    /// Connections to federations' guardians
+    pub fn connectors(&self) -> &ConnectorRegistry {
+        self.0.connectors()
+    }
+
+    /// Client of the configured mempool instance
+    pub fn esplora(&self) -> &esplora_client::AsyncClient {
+        self.0.esplora()
+    }
+
+    /// Every observed federation
+    pub async fn federations(&self) -> anyhow::Result<Vec<Federation>> {
+        self.0.list_federations().await
+    }
+
+    /// An observed federation, or `None` if the id is not one
+    pub async fn federation(
+        &self,
+        federation_id: FederationId,
+    ) -> anyhow::Result<Option<Federation>> {
+        self.0.get_federation(federation_id).await
+    }
+
+    /// Fails unless the federation is observed. For ids from request paths,
+    /// before anything is cached for them.
+    pub async fn ensure_observed(&self, federation_id: FederationId) -> anyhow::Result<()> {
+        self.0.ensure_observed(federation_id).await
+    }
+
+    /// The config behind an invite code, downloaded from its guardians once.
+    /// For federations that aren't observed.
+    pub async fn config_for_invite(&self, invite: &InviteCode) -> anyhow::Result<JsonClientConfig> {
+        self.0
+            .federation_config_cache()
+            .fetch_config_cached(invite, &self.0)
+            .await
+    }
+}
+
+/// A module's background task
+pub type Task = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+
 /// The schema a module's tables live in, `fmo_<kind>`
 pub fn schema_name(kind: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
@@ -145,6 +213,37 @@ pub trait ObserverModule: Send + Sync + 'static {
     /// refreshes every minute
     fn materialized_views(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// Endpoints under `/federations/:federation_id`, whose handlers get the
+    /// id as a `Path<FederationId>` and [`Services`] as their state
+    fn federation_routes(&self) -> Option<Router<Services>> {
+        None
+    }
+
+    /// Endpoints under `/config/:invite`, for federations known by invite code
+    /// only
+    fn config_routes(&self) -> Option<Router<Services>> {
+        None
+    }
+
+    /// The module's background task for one federation, if it has one for it.
+    /// Core runs it supervised: 30 s after it ends or fails, it asks for the
+    /// task again and runs that, so this must answer the same for a federation
+    /// every time.
+    fn federation_task(
+        &self,
+        _services: &Services,
+        _federation_id: FederationId,
+        _config: ClientConfig,
+    ) -> Option<Task> {
+        None
+    }
+
+    /// The module's background task for all federations, if it has one,
+    /// supervised the same way
+    fn task(&self, _services: &Services) -> Option<Task> {
+        None
     }
 
     fn summarize_input(&self, input: &DynInput) -> anyhow::Result<InputSummary>;
@@ -217,6 +316,25 @@ impl ModuleRegistry {
 
     pub fn kinds(&self) -> impl Iterator<Item = &str> {
         self.modules.keys().map(String::as_str)
+    }
+
+    pub(crate) fn modules(&self) -> impl Iterator<Item = Arc<dyn ObserverModule>> + '_ {
+        self.modules.values().cloned()
+    }
+
+    /// Every module's endpoints under `/federations/:federation_id`, or `None`
+    /// when no module has any
+    pub(crate) fn federation_routes(&self) -> Option<Router<Services>> {
+        self.modules()
+            .filter_map(|module| module.federation_routes())
+            .reduce(Router::merge)
+    }
+
+    /// Every module's endpoints under `/config/:invite`
+    pub(crate) fn config_routes(&self) -> Option<Router<Services>> {
+        self.modules()
+            .filter_map(|module| module.config_routes())
+            .reduce(Router::merge)
     }
 
     /// Decoders for the given module instances; instances of kinds this build

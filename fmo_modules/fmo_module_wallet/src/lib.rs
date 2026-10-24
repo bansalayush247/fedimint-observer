@@ -1,8 +1,11 @@
 //! Observes the wallet module: peg-ins, peg-outs and the guardians' block
 //! height votes that date every session
 
+use std::sync::Arc;
+
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use axum::Router;
 use bitcoin::hashes::Hash;
 use fedimint_core::core::{Decoder, DynInput, DynModuleConsensusItem, DynOutput, ModuleKind};
 use fedimint_core::encoding::Encodable;
@@ -15,10 +18,18 @@ use fedimint_wallet_common::{
 };
 use fmo_core::module::{
     details_json, CiMeta, InputSummary, ItemMeta, ObserverModule, OutputSummary, ProcessCtx,
+    Services,
 };
 use tracing::warn;
 
-pub struct WalletObserver;
+use crate::utxos::UtxoCaches;
+
+mod utxos;
+
+#[derive(Default)]
+pub struct WalletObserver {
+    utxo_caches: Arc<UtxoCaches>,
+}
 
 fn wallet_input(input: &DynInput) -> anyhow::Result<&WalletInput> {
     input
@@ -120,6 +131,10 @@ impl ObserverModule for WalletObserver {
     /// The federation's unspent outputs, built from peg-ins and peg-outs
     fn materialized_views(&self) -> &'static [&'static str] {
         &["fmo_wallet.utxos"]
+    }
+
+    fn federation_routes(&self) -> Option<Router<Services>> {
+        Some(utxos::federation_routes(self.utxo_caches.clone()))
     }
 
     async fn process_output(
@@ -305,7 +320,7 @@ mod tests {
                 bytes: vec![],
             },
         );
-        assert!(WalletObserver.summarize_input(&input).is_err());
+        assert!(WalletObserver::default().summarize_input(&input).is_err());
 
         let output = DynOutput::from_typed(
             0,
@@ -314,6 +329,6 @@ mod tests {
                 bytes: vec![],
             },
         );
-        assert!(WalletObserver.summarize_output(&output).is_err());
+        assert!(WalletObserver::default().summarize_output(&output).is_err());
     }
 }

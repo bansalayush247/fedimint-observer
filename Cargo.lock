@@ -2609,10 +2609,20 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.7.9",
+ "chrono",
+ "fedimint-api-client",
+ "fedimint-connectors",
  "fedimint-core 0.12.0",
  "fedimint-ln-common",
+ "fmo_api_types",
  "fmo_core",
+ "futures",
+ "postgres-from-row",
+ "serde",
  "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2621,9 +2631,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.7.9",
+ "chrono",
  "fedimint-core 0.12.0",
  "fedimint-mint-common",
+ "fmo_api_types",
  "fmo_core",
+ "postgres-from-row",
  "serde_json",
 ]
 
@@ -2644,11 +2658,18 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.7.9",
  "bitcoin 0.32.102",
+ "esplora-client 0.10.0",
+ "fedimint-api-client",
  "fedimint-core 0.12.0",
  "fedimint-wallet-common",
+ "fmo_api_types",
  "fmo_core",
+ "futures",
+ "postgres-from-row",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 
