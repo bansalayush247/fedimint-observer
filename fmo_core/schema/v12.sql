@@ -294,3 +294,36 @@ SELECT federation_id,
 FROM guardian_health
 WHERE time >= date_trunc('hour', NOW()::timestamp - INTERVAL '31 days')
 GROUP BY 1, 2, 3;
+
+-- Module schemas
+--
+-- Each module owns a schema, fmo_<kind>, for the tables it derives from
+-- sessions. Core keeps the module-agnostic tables in public. Moving a table is
+-- a catalog change: its rows, indexes and constraints stay. Later changes to a
+-- module's tables come from ObserverModule::migrations(), run in its schema.
+CREATE SCHEMA fmo_wallet;
+ALTER TABLE wallet_peg_ins SET SCHEMA fmo_wallet;
+ALTER TABLE fmo_wallet.wallet_peg_ins RENAME TO peg_ins;
+ALTER TABLE wallet_withdrawal_transactions SET SCHEMA fmo_wallet;
+ALTER TABLE fmo_wallet.wallet_withdrawal_transactions RENAME TO withdrawal_transactions;
+ALTER TABLE wallet_withdrawal_signatures SET SCHEMA fmo_wallet;
+ALTER TABLE fmo_wallet.wallet_withdrawal_signatures RENAME TO withdrawal_signatures;
+ALTER TABLE wallet_withdrawal_transaction_inputs SET SCHEMA fmo_wallet;
+ALTER TABLE fmo_wallet.wallet_withdrawal_transaction_inputs RENAME TO withdrawal_transaction_inputs;
+ALTER TABLE wallet_withdrawal_transaction_outputs SET SCHEMA fmo_wallet;
+ALTER TABLE fmo_wallet.wallet_withdrawal_transaction_outputs RENAME TO withdrawal_transaction_outputs;
+ALTER MATERIALIZED VIEW utxos SET SCHEMA fmo_wallet;
+
+CREATE SCHEMA fmo_ln;
+ALTER TABLE ln_contracts SET SCHEMA fmo_ln;
+ALTER TABLE fmo_ln.ln_contracts RENAME TO contracts;
+
+-- block_height_votes stays in public: the wallet module records the votes,
+-- but session_times, a core read model, is built from them.
+
+-- How many of its own migrations each module has run. The tables moved above
+-- are the starting point every module's migrations build on.
+CREATE TABLE module_schema_versions (
+    module_kind TEXT PRIMARY KEY,
+    migrations_applied INTEGER NOT NULL
+);

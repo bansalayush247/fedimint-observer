@@ -44,7 +44,9 @@ use crate::db::{migration, migration_backfill, schema_setup, DbMigration};
 use crate::federation::db::Federation;
 use crate::federation::gateways::GatewayOverviewCache;
 use crate::federation::{db, instance_to_kind};
-use crate::module::{CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx};
+use crate::module::{
+    schema_name, CiMeta, InputSummary, ItemMeta, ModuleRegistry, OutputSummary, ProcessCtx,
+};
 use crate::task::supervise;
 use crate::util::{federation_api, module_instance_id, query, query_one, query_opt, query_value};
 
@@ -333,22 +335,15 @@ impl FederationObserver {
             "Database schema is newer than this binary; use a compatible observer version"
         );
 
-        // Backfills reprocess stored sessions with the registered modules and
-        // mark the migration done, so a build missing one would leave its
-        // data incomplete for good
-        const BACKFILL_MODULES: [&str; 3] = ["ln", "mint", "wallet"];
-        let needs_backfill = migrations.iter().enumerate().any(|(index, migration)| {
-            migration.backfill.is_some()
-                && maybe_schema_version.is_some_and(|schema_version| index > schema_version)
-        });
-        if needs_backfill {
-            let missing = BACKFILL_MODULES
-                .into_iter()
-                .filter(|kind| self.modules.get(kind).is_none())
-                .collect::<Vec<_>>();
+        // The v8 and v11 backfills reprocess stored sessions with the modules
+        // of this build, whose tables now live in the fmo_<kind> schemas that
+        // only exist from v12 on. Only an empty database may run them: a
+        // populated one must already be at the last version before the move.
+        const MIN_UPGRADE_VERSION: usize = 11;
+        if let Some(version) = maybe_schema_version {
             ensure!(
-                missing.is_empty(),
-                "Pending migrations reprocess stored data and need the {missing:?} modules, which this build doesn't include"
+                version >= MIN_UPGRADE_VERSION,
+                "Database schema is at v{version}, but this version of Fedimint Observer upgrades from v{MIN_UPGRADE_VERSION} or newer; run the previous release first"
             );
         }
 
@@ -387,6 +382,52 @@ impl FederationObserver {
                 .await?;
         }
 
+        self.setup_module_schemas().await
+    }
+
+    /// Creates every registered module's schema and runs the module's own
+    /// migrations a database hasn't seen, each in its own transaction with the
+    /// module's schema first on the search path
+    async fn setup_module_schemas(&self) -> anyhow::Result<()> {
+        for kind in self.modules.kinds() {
+            let module = self.modules.get(kind).expect("listed by the registry");
+            let schema = schema_name(kind)?;
+            let mut connection = self.connection().await?;
+            connection
+                .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                .await?;
+
+            let applied = connection
+                .query_opt(
+                    "SELECT migrations_applied FROM module_schema_versions WHERE module_kind = $1",
+                    &[&kind],
+                )
+                .await?
+                .map_or(0, |row| row.get::<_, i32>(0) as usize);
+            let migrations = module.migrations();
+            ensure!(
+                applied <= migrations.len(),
+                "Module {kind} ran {applied} migrations but this binary only knows {}; use a compatible observer version",
+                migrations.len()
+            );
+
+            for (index, sql) in migrations.iter().enumerate().skip(applied) {
+                info!("Running migration {} of module {kind}", index + 1);
+                let dbtx = connection.transaction().await?;
+                dbtx.batch_execute(&format!("SET LOCAL search_path TO {schema}, public"))
+                    .await?;
+                dbtx.batch_execute(sql).await?;
+                dbtx.execute(
+                    "INSERT INTO module_schema_versions (module_kind, migrations_applied)
+                     VALUES ($1, $2)
+                     ON CONFLICT (module_kind) DO UPDATE
+                         SET migrations_applied = EXCLUDED.migrations_applied",
+                    &[&kind, &(index as i32 + 1)],
+                )
+                .await?;
+                dbtx.commit().await?;
+            }
+        }
         Ok(())
     }
 
@@ -1133,15 +1174,18 @@ impl FederationObserver {
         }
     }
 
+    /// Refreshes the materialized views the modules declare
     async fn refresh_views_inner(&self) -> anyhow::Result<()> {
-        self.connection()
-            .await?
-            .batch_execute(
-                "
-                REFRESH MATERIALIZED VIEW CONCURRENTLY utxos;
-                ",
-            )
-            .await?;
+        let connection = self.connection().await?;
+        for kind in self.modules.kinds() {
+            let module = self.modules.get(kind).expect("listed by the registry");
+            for view in module.materialized_views() {
+                connection
+                    .batch_execute(&format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {view}"))
+                    .await
+                    .with_context(|| format!("refreshing {view} of module {kind}"))?;
+            }
+        }
 
         Ok(())
     }
@@ -1177,8 +1221,10 @@ impl FederationObserver {
 
         query::<FederationUtxoRaw>(
             &self.connection().await?,
+            // The wallet module's view, read here until the UTXO endpoint
+            // moves into the module
             // language=postgresql
-            "SELECT on_chain_txid, on_chain_vout, address, amount_msat FROM utxos WHERE federation_id = $1 ORDER BY amount_msat DESC",
+            "SELECT on_chain_txid, on_chain_vout, address, amount_msat FROM fmo_wallet.utxos WHERE federation_id = $1 ORDER BY amount_msat DESC",
             &[&federation_id.consensus_encode_to_vec()],
         ).await?.into_iter().map(|utxo| {
             Result::<_, anyhow::Error>::Ok(FederationUtxo {

@@ -100,7 +100,7 @@ impl ObserverModule for WalletObserver {
 
         ctx.dbtx
             .execute(
-                "INSERT INTO wallet_peg_ins VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+                "INSERT INTO fmo_wallet.peg_ins VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
                 &[
                     &outpoint.txid[..].to_owned(),
                     &(outpoint.vout as i32),
@@ -115,6 +115,11 @@ impl ObserverModule for WalletObserver {
             )
             .await?;
         Ok(())
+    }
+
+    /// The federation's unspent outputs, built from peg-ins and peg-outs
+    fn materialized_views(&self) -> &'static [&'static str] {
+        &["fmo_wallet.utxos"]
     }
 
     async fn process_output(
@@ -166,24 +171,14 @@ impl ObserverModule for WalletObserver {
             .context("config says this should be a wallet CI")?;
         match wallet_ci {
             WalletConsensusItem::BlockCount(height_vote) => {
-                dbtx.execute(
-                    "INSERT INTO block_height_votes VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-                    &[
-                        &meta.federation_id.consensus_encode_to_vec(),
-                        &(meta.session_index as i32),
-                        &(meta.item_index as i32),
-                        &(meta.peer.to_usize() as i32),
-                        &(*height_vote as i32),
-                    ],
-                )
-                .await?;
+                ctx.record_block_height_vote(meta, *height_vote).await?;
             }
             WalletConsensusItem::PegOutSignature(peg_out_sig) => {
                 let peg_out_txid = peg_out_sig.txid;
                 let peg_out_txid_encoded = peg_out_sig.txid.to_byte_array().to_vec();
 
                 dbtx.execute(
-                    "INSERT INTO wallet_withdrawal_transactions (on_chain_txid, federation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    "INSERT INTO fmo_wallet.withdrawal_transactions (on_chain_txid, federation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                     &[
                         &peg_out_txid_encoded,
                         &meta.federation_id.consensus_encode_to_vec(),
@@ -192,7 +187,7 @@ impl ObserverModule for WalletObserver {
                 .await?;
 
                 dbtx.execute(
-                    "INSERT INTO wallet_withdrawal_signatures VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    "INSERT INTO fmo_wallet.withdrawal_signatures VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                     &[
                         &peg_out_txid_encoded,
                         &(meta.session_index as i32),
@@ -206,7 +201,7 @@ impl ObserverModule for WalletObserver {
                     .query_one(
                         "
                         SELECT COUNT(peer_id)::INT num_sigs
-                        FROM wallet_withdrawal_signatures
+                        FROM fmo_wallet.withdrawal_signatures
                         WHERE on_chain_txid = $1
                         GROUP BY on_chain_txid
                         ",
@@ -224,7 +219,7 @@ impl ObserverModule for WalletObserver {
                 // at this point, the transaction reached threshold and should broadcast
 
                 let cached: bool = dbtx.query_one(
-                    "SELECT EXISTS(SELECT 1 FROM wallet_withdrawal_transaction_outputs WHERE on_chain_txid=$1)",
+                    "SELECT EXISTS(SELECT 1 FROM fmo_wallet.withdrawal_transaction_outputs WHERE on_chain_txid=$1)",
                     &[&peg_out_txid_encoded],
                 ).await?.get(0);
                 // Every signature after the threshold lands here too; the
@@ -255,7 +250,7 @@ impl ObserverModule for WalletObserver {
                     let prev_out_txid = input.previous_output.txid.to_byte_array().to_vec();
 
                     dbtx.execute(
-                        "INSERT INTO wallet_withdrawal_transaction_inputs VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        "INSERT INTO fmo_wallet.withdrawal_transaction_inputs VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
                         &[
                             &prev_out_txid,
                             &(input.previous_output.vout as i32),
@@ -273,7 +268,7 @@ impl ObserverModule for WalletObserver {
                     .context("Peg-out output has no address")?;
 
                     dbtx.execute(
-                        "INSERT INTO wallet_withdrawal_transaction_outputs VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                        "INSERT INTO fmo_wallet.withdrawal_transaction_outputs VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                         &[
                             &peg_out_txid_encoded,
                             &(out_idx as i32),

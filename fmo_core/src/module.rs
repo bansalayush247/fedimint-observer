@@ -9,6 +9,12 @@
 //! their kind and no amount or details. Adding the module to a build later
 //! doesn't fill those in yet: core rows are written once (`ON CONFLICT DO
 //! NOTHING`), so that needs the replay of a later step of issue #8.
+//!
+//! A module's tables live in its own schema, `fmo_<kind>` (see
+//! [`schema_name`]), created by core at startup. Core's tables stay in
+//! `public`. Module SQL names its tables schema-qualified, since one session
+//! transaction runs every module; only the module's own migrations run with
+//! its schema first on the search path.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,6 +24,7 @@ use fedimint_core::config::{ClientConfig, FederationId};
 use fedimint_core::core::{
     Decoder, DynInput, DynModuleConsensusItem, DynOutput, ModuleInstanceId, ModuleKind,
 };
+use fedimint_core::encoding::Encodable;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::{PeerId, TransactionId};
 
@@ -78,6 +85,39 @@ pub struct ProcessCtx<'a> {
     pub esplora: &'a esplora_client::AsyncClient,
 }
 
+impl ProcessCtx<'_> {
+    /// Records a guardian's vote on the current block height in `ci`, which
+    /// dates the session. The votes are core's: `session_times` is built from
+    /// them.
+    pub async fn record_block_height_vote(&self, meta: &CiMeta, height: u32) -> anyhow::Result<()> {
+        self.dbtx
+            .execute(
+                "INSERT INTO block_height_votes VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                &[
+                    &meta.federation_id.consensus_encode_to_vec(),
+                    &(meta.session_index as i32),
+                    &(meta.item_index as i32),
+                    &(meta.peer.to_usize() as i32),
+                    &(height as i32),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// The schema a module's tables live in, `fmo_<kind>`
+pub fn schema_name(kind: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !kind.is_empty()
+            && kind
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "Module kind {kind:?} can't name a schema"
+    );
+    Ok(format!("fmo_{kind}"))
+}
+
 /// A Fedimint module the observer can decode and process.
 ///
 /// `summarize_*` must not do I/O: core calls them before writing its own row.
@@ -91,6 +131,21 @@ pub trait ObserverModule: Send + Sync + 'static {
     fn kind(&self) -> ModuleKind;
 
     fn decoder(&self) -> Decoder;
+
+    /// Migrations of the module's own schema, appended to over time and never
+    /// changed: core runs the ones a database hasn't seen, in order, each with
+    /// the module's schema first on the search path so table names can be
+    /// unqualified. The tables core's v12 moved into the schema are what the
+    /// first one builds on.
+    fn migrations(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Materialized views in the module's schema, schema-qualified, that core
+    /// refreshes every minute
+    fn materialized_views(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     fn summarize_input(&self, input: &DynInput) -> anyhow::Result<InputSummary>;
 

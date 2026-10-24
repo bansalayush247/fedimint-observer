@@ -97,7 +97,7 @@ impl ObserverModule for LnObserver {
 
         ctx.dbtx
             .execute(
-                "INSERT INTO ln_contracts VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                "INSERT INTO fmo_ln.contracts VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                 &[
                     &meta.federation_id.consensus_encode_to_vec(),
                     &contract.contract.contract_id().consensus_encode_to_vec(),

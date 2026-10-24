@@ -78,7 +78,7 @@ just test_package fmo_core
 ### Key Patterns
 1. **Shared Types**: API types are defined in `fmo_api_types` for the backend; the React frontend mirrors them by hand in `fmo_frontend_react/src/types/api.ts`, so keep both in sync
 2. **Database Migrations**: Version-controlled SQL migrations in `fmo_core/schema/` (v0-v12)
-3. **Modules**: Core writes the module-agnostic rows of every session item from the summary the owning module returns, then lets the module write its own tables in the same transaction. Kinds without a module in the build are stored without amounts or details, and adding the module later does not fill them in yet (core rows are written once). The default build must keep mint, wallet and ln: the v8 and v11 backfills need them. Module-specific API endpoints and background tasks (UTXOs, nonces, gateways) still live in `fmo_core`.
+3. **Modules**: Core writes the module-agnostic rows of every session item from the summary the owning module returns, then lets the module write its own tables in the same transaction. Kinds without a module in the build are stored without amounts or details, and adding the module later does not fill them in yet (core rows are written once). Each module's tables live in its own schema, `fmo_<kind>` (`fmo_wallet.peg_ins`, `fmo_ln.contracts`, ...), which core creates at startup; module SQL uses schema-qualified names, and a module's own future migrations come from `ObserverModule::migrations()` (tracked in `module_schema_versions`). `block_height_votes` stays in `public` because core's `session_times` is built from it; the wallet module records votes through `ProcessCtx::record_block_height_vote`. A populated database upgrades only from v11 or newer (`MIN_UPGRADE_VERSION`): the v8 and v11 backfills run module code that writes to the `fmo_<kind>` schemas, which exist only from v12 on. Module-specific API endpoints and background tasks (UTXOs, nonces, gateways) still live in `fmo_core`.
 4. **Background Monitoring**: `FederationObserver` spawns tasks to monitor multiple federations concurrently
 5. **State Management**: Backend uses shared app state with Arc/RwLock for thread safety
 6. **Error Handling**: Custom `AppError` type wrapping `anyhow::Error` for consistent error propagation
@@ -102,6 +102,8 @@ PostgreSQL. Key tables:
 - `transactions` - Transaction records
 - `guardian_health` - Guardian monitoring data
 - `nostr_*` - Nostr protocol integration
+- `fmo_wallet.*` - peg-ins, peg-out transactions/signatures/inputs/outputs and the `utxos` materialized view
+- `fmo_ln.contracts` - Lightning contracts
 
 Read models, kept current as data is written so requests never aggregate the full history (v9, v12):
 - `session_times`, `federation_daily_activity` - written per new session by `record_new_session()`, in the session's transaction; `rebuild_read_models()` after reprocessing stored sessions
